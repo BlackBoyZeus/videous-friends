@@ -1,0 +1,58 @@
+# Virtual environments
+pegasus_env_py310/
+**/venv*/
+**/__pycache__/
+
+# OS specific files
+.DS_Store
+**/.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+
+# Large media files
+**/*.mp4
+**/*.mov
+**/*.MOV
+**/*.wav
+**/*.mp3
+
+# Model files
+**/models/*.pth
+**/models/*.pt
+**/models/*.pb
+**/models/*.bin
+**/models/*.onnx
+
+# Output directories
+**/output*/
+**/final_renders/
+**/backup_redundant_files/
+**/compositing_output/
+**/output_results*/
+**/starleague_engine_output/
+
+# Temporary files
+**/*TEMP_MPY_wvf_snd*
+temp_*.wav
+
+# Build directories
+**/build/
+**/dist/
+**/.eggs/
+
+# Logs
+**/logs/*.log
+
+# Virtual environments
+**/lib/python*/
+**/bin/
+**/include/
+
+# Keep model directory structure but not large files
+!**/models/
+!**/models/README.md
+
+# Keep empty directories with .gitkeep
+!**/.gitkeep

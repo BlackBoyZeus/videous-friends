@@ -1,0 +1,44 @@
+Email:
+  from_email: sender@example.com
+  smtp_password: your_password
+  smtp_port: '587'
+  smtp_server: smtp.example.com
+  smtp_user: your_username
+Settings:
+  action_score_distribution: Gaussian
+  adaptive_threshold_factor: '1.5'
+  adaptive_threshold_window: '150'
+  audio_analysis_method: RMS_MFCC
+  audio_mfcc_percentile: '90.0'
+  audio_rms_threshold: '-30.0'
+  complexity: '1'
+  confidence: '0.5'
+  enable_upsampling: 'True'
+  frame_limit: '0'
+  interest_threshold: '0.6'
+  last_gui_mode: Advanced
+  last_output_dir: /Users/blblackboyzeusackboyzeus/Documents/screen record
+  min_highlight_duration: '1.5'
+  notify_email: ''
+  output_filename: test
+  padding_seconds: '1.0'
+  pipeline: FFMPEG
+  resolution_scale: '1.0'
+  scoring_method: WEIGHTED_THRESHOLD
+  skip_interval: '1'
+  smoothing_factor: '5.0'
+  track_enabled: 'True'
+  tracking_confidence: '0.5'
+  upsample_model: edsr
+  upsample_scale: '2'
+  use_adaptive_audio_threshold: 'True'
+  use_dynamic_hmm: 'True'
+  use_hybrid_scoring: 'False'
+  use_kalman_filter: 'False'
+  use_opencv: 'False'
+Weights:
+  action: '0.7'
+  audio_rms: '0.1'
+  mfcc_change: '0.1'
+  motion: '0.1'
+  wavelet: '0.1'

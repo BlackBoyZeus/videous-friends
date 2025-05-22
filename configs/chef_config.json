@@ -1,0 +1,13 @@
+{
+    "input_source": "0",
+    "output_path": "output.mp4",
+    "lut_dir": "/Users/blblackboyzeusackboyzeus/Downloads/pegasusEditorMacOS/Videous CHEF/Videous/70 CGC LUTs",
+    "rvm_background_path": null,
+    "sam_checkpoint_path": null,
+    "sam2_checkpoint_path": null,
+    "mode": "live",
+    "display": true,
+    "device": "mps",
+    "trail_length": 30,
+    "glow_intensity": 0.5
+}

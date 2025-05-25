@@ -1,21 +1,27 @@
 
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os
+
+# Standard Library
+import abc  # For Effect base classes
+import argparse
+from collections import deque
+from dataclasses import dataclass  # For effect data classes
+import inspect  # Used in FrameEffectWrapper
 import json
+import logging
+import math
+import os
+import random
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+# Third-Party Libraries
 import cv2
 import numpy as np
-from typing import Dict, Optional, List, Tuple, Any
-import logging
-import time
-import random
-import math
-from collections import deque
-from PIL import Image  # Keep for potential future use
 import torch
 import torchvision.transforms as T
-import argparse
-import inspect  # Used in FrameEffectWrapper
+# from PIL import Image # REMOVED - No direct usage found in this file
 
 # --- Optional Dependency Imports ---
 try:
@@ -125,6 +131,514 @@ SUPPORTED_SAM2_MODELS = [
 
 
 # --- Utility Functions ---
+# ========================================================================
+#                       Effect Base Classes (from video_effects.py)
+# ========================================================================
+class Effect(abc.ABC):
+    def __init__(self):
+        self._validate_params()
+    def _validate_params(self) -> None: pass
+    @abc.abstractmethod
+    def apply(self, *args, **kwargs) -> np.ndarray: pass
+
+class IntraClipEffect(Effect):
+    @abc.abstractmethod
+    def apply(self, frame: np.ndarray, frame_time: float, clip_duration: float) -> np.ndarray: pass
+
+class TransitionEffect(Effect):
+    duration: float = 0.5
+    def __init__(self, duration: float = 0.5):
+        self.duration = max(0.01, duration)
+        super().__init__()
+    @abc.abstractmethod
+    def apply(self, frame_a: np.ndarray, frame_b: np.ndarray, progress: float) -> np.ndarray: pass
+
+# ========================================================================
+#               Enhanced Intra-Clip Effects (from video_effects.py)
+# ========================================================================
+@dataclass
+class BrightnessContrast(IntraClipEffect):
+    brightness: float = 0.0
+    contrast: float = 1.0
+    gamma: float = 1.0
+    per_channel: bool = False  # Not yet controllable by UI
+    fade_in: bool = False      # Not yet controllable by UI
+
+    def _validate_params(self):
+        self.brightness = np.clip(self.brightness, -1.0, 1.0)
+        self.contrast = np.clip(self.contrast, 0.0, 3.0)
+        self.gamma = max(0.1, self.gamma)
+
+    def apply(self, frame: np.ndarray, frame_time: float, clip_duration: float, runner: Optional[Any] = None, **kwargs) -> np.ndarray:
+        if runner and hasattr(runner, 'bc_params'):
+            self.brightness = runner.bc_params.get('brightness', self.brightness)
+            self.contrast = runner.bc_params.get('contrast', self.contrast)
+            self.gamma = runner.bc_params.get('gamma', self.gamma)
+            # self.per_channel = runner.bc_params.get('per_channel', self.per_channel) # Deferred
+            # self.fade_in = runner.bc_params.get('fade_in', self.fade_in) # Deferred
+            self._validate_params() # Re-validate if params changed
+
+        frame = validate_frame(frame)
+        if abs(self.contrast - 1.0) < 1e-3 and abs(self.brightness) < 1e-3 and abs(self.gamma - 1.0) < 1e-3 and not self.fade_in:
+            return frame
+        try:
+            factor = (frame_time / max(clip_duration, 1e-6)) if self.fade_in and clip_duration > 0 else 1.0
+            curr_brightness = self.brightness * factor
+            curr_contrast = 1.0 + (self.contrast - 1.0) * factor
+            curr_gamma = 1.0 + (self.gamma - 1.0) * factor if self.gamma != 1.0 else 1.0
+
+            if self.per_channel:
+                result = np.zeros_like(frame, dtype=np.float32)
+                for c in range(3):
+                    channel = frame[:, :, c].astype(np.float32)
+                    channel = (channel - 127.5) * curr_contrast + 127.5 + curr_brightness * 255
+                    if curr_gamma != 1.0:
+                        inv_gamma = 1.0 / curr_gamma
+                        channel_norm = np.clip(channel / 255.0, 0, 1)
+                        channel_gamma_corrected = np.power(channel_norm, inv_gamma) * 255.0
+                        channel = channel_gamma_corrected
+                    result[:, :, c] = np.clip(channel, 0, 255)
+                return result.astype(np.uint8)
+            else:
+                frame_float = frame.astype(np.float32)
+                adjusted = (frame_float - 127.5) * curr_contrast + 127.5 + curr_brightness * 255
+                if curr_gamma != 1.0:
+                    inv_gamma = 1.0 / curr_gamma
+                    adjusted_norm = np.clip(adjusted / 255.0, 0, 1)
+                    adjusted_gamma_corrected = np.power(adjusted_norm, inv_gamma) * 255.0
+                    adjusted = adjusted_gamma_corrected
+                return np.clip(adjusted, 0, 255).astype(np.uint8)
+        except Exception as e:
+            logger.warning(f"BrightnessContrast failed: {e}")
+            return frame
+
+@dataclass
+class Saturation(IntraClipEffect):
+    scale: float = 1.0
+    vibrance: float = 0.0
+    fade_in: bool = False      # Not yet controllable by UI
+
+    def _validate_params(self):
+        self.scale = max(0.0, self.scale)
+        self.vibrance = np.clip(self.vibrance, 0.0, 1.0)
+
+    def apply(self, frame: np.ndarray, frame_time: float, clip_duration: float, runner: Optional[Any] = None, **kwargs) -> np.ndarray:
+        if runner and hasattr(runner, 'saturation_params'):
+            self.scale = runner.saturation_params.get('scale', self.scale)
+            self.vibrance = runner.saturation_params.get('vibrance', self.vibrance)
+            # self.fade_in = runner.saturation_params.get('fade_in', self.fade_in) # Deferred
+            self._validate_params()
+
+        frame = validate_frame(frame)
+        if abs(self.scale - 1.0) < 1e-3 and abs(self.vibrance) < 1e-3 and not self.fade_in:
+            return frame
+        try:
+            factor = (frame_time / max(clip_duration, 1e-6)) if self.fade_in and clip_duration > 0 else 1.0
+            curr_scale = 1.0 + (self.scale - 1.0) * factor
+            curr_vibrance = self.vibrance * factor
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+            s = hsv[:, :, 1]
+            if curr_vibrance > 0:
+                s_max = np.max(s)
+                if s_max > 1e-6: # Avoid division by zero for fully desaturated images
+                    vibrance_boost = (1.0 - s / s_max) * curr_vibrance * s_max
+                    s += vibrance_boost
+            hsv[:, :, 1] = np.clip(s * curr_scale, 0, 255)
+            return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        except Exception as e:
+            logger.warning(f"Saturation failed: {e}")
+            return frame
+
+@dataclass
+class Vignette(IntraClipEffect):
+    strength: float = 0.5
+    radius: float = 0.6
+    falloff: float = 0.3
+    shape: str = 'circular'  # Not yet controllable by UI
+    color: Tuple[int, int, int] = (0, 0, 0)  # BGR, Not yet controllable by UI
+    fade_in: bool = False      # Not yet controllable by UI
+
+    def _validate_params(self):
+        self.strength = np.clip(self.strength, 0.0, 1.0)
+        self.radius = np.clip(self.radius, 0.0, 1.0)
+        self.falloff = max(0.01, self.falloff)
+        self.shape = self.shape if self.shape in ['circular', 'elliptical', 'rectangular'] else 'circular'
+
+    def _create_mask(self, height: int, width: int, strength: float, radius: float, falloff: float, shape: str) -> np.ndarray:
+        # Parameters are passed explicitly to use potentially updated values
+        cx, cy = width / 2, height / 2
+        x, y = np.meshgrid(np.arange(width), np.arange(height))
+
+        if shape == 'circular':
+            max_dim = max(width, height)
+            d = np.sqrt((x - cx)**2 + (y - cy)**2) / max(max_dim / 2, 1e-6)
+        elif shape == 'elliptical':
+            d = np.sqrt(((x - cx)/(width/2 + 1e-6))**2 + ((y - cy)/(height/2 + 1e-6))**2)
+        else:  # rectangular
+            d = np.maximum(np.abs(x - cx) / (width / 2 + 1e-6), np.abs(y - cy) / (height / 2 + 1e-6))
+
+        mask = 1.0 - strength * (1.0 / (1.0 + np.exp(-(d - radius) / falloff)))
+        return mask[:, :, np.newaxis].astype(np.float32)
+
+    def apply(self, frame: np.ndarray, frame_time: float, clip_duration: float, runner: Optional[Any] = None, **kwargs) -> np.ndarray:
+        if runner and hasattr(runner, 'vignette_params'):
+            self.strength = runner.vignette_params.get('strength', self.strength)
+            self.radius = runner.vignette_params.get('radius', self.radius)
+            self.falloff = runner.vignette_params.get('falloff', self.falloff)
+            # self.shape = runner.vignette_params.get('shape', self.shape) # Deferred
+            # self.color = runner.vignette_params.get('color', self.color) # Deferred
+            # self.fade_in = runner.vignette_params.get('fade_in', self.fade_in) # Deferred
+            self._validate_params()
+
+        frame = validate_frame(frame)
+        if abs(self.strength) < 1e-3 and not self.fade_in:
+            return frame
+        try:
+            factor = (frame_time / max(clip_duration, 1e-6)) if self.fade_in and clip_duration > 0 else 1.0
+            current_strength = self.strength * factor # Apply fade-in to strength
+
+            mask = self._create_mask(frame.shape[0], frame.shape[1], current_strength, self.radius, self.falloff, self.shape)
+            vignette_layer = np.full_like(frame, self.color, dtype=np.float32) # Use instance color
+            return np.clip(frame.astype(np.float32) * mask + vignette_layer * (1.0 - mask), 0, 255).astype(np.uint8)
+        except Exception as e:
+            logger.warning(f"Vignette failed: {e}")
+            return frame
+
+@dataclass
+class Blur(IntraClipEffect):
+    kernel_size: int = 5
+    sigma: float = 0.0         # Not yet controllable by UI
+    fade_in: bool = False      # Not yet controllable by UI
+
+    def _validate_params(self):
+        self.kernel_size = max(3, self.kernel_size if self.kernel_size % 2 != 0 else self.kernel_size + 1)
+        self.sigma = max(0.0, self.sigma)
+
+    def apply(self, frame: np.ndarray, frame_time: float, clip_duration: float, runner: Optional[Any] = None, **kwargs) -> np.ndarray:
+        if runner and hasattr(runner, 'blur_params'):
+            self.kernel_size = runner.blur_params.get('kernel_size', self.kernel_size)
+            # Ensure kernel_size is odd after updating from trackbar
+            self.kernel_size = max(3, self.kernel_size if self.kernel_size % 2 != 0 else self.kernel_size -1 if self.kernel_size > 3 else self.kernel_size + 1)
+            # self.sigma = runner.blur_params.get('sigma', self.sigma) # Deferred
+            # self.fade_in = runner.blur_params.get('fade_in', self.fade_in) # Deferred
+            self._validate_params()
+
+        frame = validate_frame(frame)
+        if self.kernel_size < 3 and abs(self.sigma) < 1e-3 and not self.fade_in:
+             return frame
+        try:
+            factor = (frame_time / max(clip_duration, 1e-6)) if self.fade_in and clip_duration > 0 else 1.0
+            # Apply fade-in to kernel size. Start from 1 (no blur) up to kernel_size.
+            # Ensure kernel_size is at least 3 and odd.
+            current_kernel_float = 1 + (self.kernel_size - 1) * factor
+            current_kernel = int(current_kernel_float)
+            current_kernel = max(3, current_kernel if current_kernel % 2 != 0 else current_kernel + 1)
+
+            if current_kernel < 3 : # Effectively no blur
+                return frame
+            return cv2.GaussianBlur(frame, (current_kernel, current_kernel), self.sigma)
+        except Exception as e:
+            logger.warning(f"Blur failed: {e}")
+            return frame
+
+# ========================================================================
+#                       Effect Base Classes (from video_effects.py)
+# ========================================================================
+# (Effect, IntraClipEffect, TransitionEffect are already added)
+
+# Add VideoEffect base class from video_effectsfinale.py
+class VideoEffect(abc.ABC):
+    """Base class for algorithmic effects."""
+    @abc.abstractmethod
+    def process(self, frame: np.ndarray, **kwargs) -> np.ndarray:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+class MotionBlurEffect(VideoEffect): # Inherits from VideoEffect
+    """Applies simple horizontal motion blur using OpenCV."""
+    def __init__(self, kernel_size: int = 19): # Default kernel_size from video_effectsfinale.py
+        # Ensure kernel_size is odd and at least 3
+        self.kernel_size = max(3, kernel_size if kernel_size % 2 != 0 else kernel_size + 1)
+
+    def process(self, frame: np.ndarray, **kwargs) -> np.ndarray:
+        frame = validate_frame(frame)
+        # Create a horizontal motion blur kernel
+        kernel = np.zeros((self.kernel_size, self.kernel_size), dtype=np.float32)
+        kernel[self.kernel_size // 2, :] = 1.0 / self.kernel_size
+        try:
+            return cv2.filter2D(frame, -1, kernel)
+        except cv2.error as e:
+            logger.warning(f"MotionBlurEffect (kernel) failed: {e}")
+            return frame
+
+    def reset(self) -> None:
+        pass
+
+class ChromaticAberrationEffect(VideoEffect): # Inherits from VideoEffect
+    """
+    Enhanced radial chromatic aberration with amplified fringing for visibility:
+    - Larger radial scaling with saturation-based strength.
+    - Exaggerated edge effects with a higher boost.
+    - Visual debugging with colored borders to highlight channel shifts (optional).
+    """
+    def __init__(self,
+                 base_strength: float = 0.05, # Renamed from strength to base_strength for clarity
+                 center: Optional[Tuple[float, float]] = None, # Normalized (0-1) center point (x,y)
+                 non_linear_exponent: float = 3.0,
+                 edge_boost: float = 4.0,
+                 debug_borders: bool = False): # Added debug_borders
+        self.base_strength = max(0.0, base_strength)
+        self.center = center
+        self.non_linear_exponent = max(1.0, non_linear_exponent)
+        self.edge_boost = max(1.0, edge_boost)
+        self.debug_borders = debug_borders
+
+    def process(self, frame: np.ndarray, **kwargs) -> np.ndarray:
+        frame = validate_frame(frame)
+        h, w = frame.shape[:2]
+
+        try:
+            cx, cy = (w / 2.0, h / 2.0) if self.center is None else (self.center[0] * w, self.center[1] * h)
+            cx, cy = np.clip(cx, 0, w - 1), np.clip(cy, 0, h - 1)
+
+            map_x_coords = np.tile(np.arange(w, dtype=np.float32), (h, 1)) # Renamed
+            map_y_coords = np.repeat(np.arange(h, dtype=np.float32).reshape(-1, 1), w, axis=1) # Renamed
+
+            delta_x = map_x_coords - cx
+            delta_y = map_y_coords - cy
+            r_dist = np.sqrt(delta_x**2 + delta_y**2) # Renamed
+            
+            # Max radius from center to any corner
+            corners = np.array([[0,0], [w,0], [0,h], [w,h]])
+            r_max = np.max(np.sqrt(np.sum((corners - np.array([cx, cy]))**2, axis=1)))
+            r_max = max(r_max, 1e-6) # Avoid division by zero
+
+            r_normalized = r_dist / r_max
+            non_linear_factor = self.edge_boost * (r_normalized ** self.non_linear_exponent)
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32) / 255.0
+            saturation = hsv[..., 1]
+            k_map = self.base_strength * (1.5 + saturation) 
+
+            scale_r = 1.0 + k_map * non_linear_factor
+            scale_b = 1.0 - k_map * non_linear_factor
+
+            map_x_r = np.clip(cx + delta_x * scale_r, 0, w - 1)
+            map_y_r = np.clip(cy + delta_y * scale_r, 0, h - 1)
+            map_x_b = np.clip(cx + delta_x * scale_b, 0, w - 1)
+            map_y_b = np.clip(cy + delta_y * scale_b, 0, h - 1)
+
+            b, g, r_channel = cv2.split(frame) # Renamed r to r_channel
+            r_shifted = cv2.remap(r_channel, map_x_r, map_y_r, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+            b_shifted = cv2.remap(b, map_x_b, map_y_b, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+
+            output = cv2.merge((b_shifted, g, r_shifted))
+
+            if self.debug_borders:
+                border_size = 5
+                output[:border_size, :] = (0, 0, 255)  # Top red
+                output[-border_size:, :] = (0, 0, 255) # Bottom red
+                output[:, :border_size] = (255, 0, 0)  # Left blue
+                output[:, -border_size:] = (255, 0, 0) # Right blue
+            # cv2.putText(output, "ChromaAberration Active", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2) # Optional
+            return output
+        except Exception as e:
+            logger.error(f"ChromaticAberrationEffect failed: {e}", exc_info=True)
+            return frame
+
+    def reset(self) -> None:
+        pass
+
+# ========================================================================
+#               Transition Effects (from video_effects.py)
+# ========================================================================
+@dataclass
+class Crossfade(TransitionEffect):
+    def apply(self, frame_a: np.ndarray, frame_b: np.ndarray, progress: float) -> np.ndarray:
+        frame_a = validate_frame(frame_a)
+        # Determine target shape from frame_b if valid, else from frame_a
+        ts = frame_b.shape if (frame_b is not None and isinstance(frame_b, np.ndarray) and frame_b.size > 0) else frame_a.shape
+        frame_b = validate_frame(frame_b, default_shape=ts) # Ensure frame_b is valid or a black frame of target size
+
+        progress = np.clip(progress, 0.0, 1.0)
+        try:
+            # Resize frames to a consistent shape before blending
+            # This uses the resize_frame from video_effectsfinale5.py
+            a_r = resize_frame(frame_a, (ts[0], ts[1]))
+            b_r = resize_frame(frame_b, (ts[0], ts[1]))
+            return cv2.addWeighted(a_r, 1.0 - progress, b_r, progress, 0.0)
+        except Exception as e:
+            logger.warning(f"Crossfade failed: {e}")
+            # Fallback logic: return one of the frames based on progress
+            return frame_b if progress > 0.5 else frame_a
+
+@dataclass
+class Slide(TransitionEffect):
+    direction: str = 'left' # 'left', 'right', 'up', 'down'
+    def _validate_params(self):
+        valid_directions = {'left', 'right', 'up', 'down'}
+        if self.direction not in valid_directions:
+            logger.warning(f"Invalid direction: {self.direction}. Defaulting to 'left'.")
+            self.direction = 'left'
+
+    def apply(self, frame_a: np.ndarray, frame_b: np.ndarray, progress: float) -> np.ndarray:
+        frame_a = validate_frame(frame_a)
+        ts = frame_b.shape if (frame_b is not None and isinstance(frame_b, np.ndarray) and frame_b.size > 0) else frame_a.shape
+        frame_b = validate_frame(frame_b, default_shape=ts)
+
+        progress = np.clip(progress, 0.0, 1.0)
+        try:
+            a = resize_frame(frame_a, (ts[0], ts[1]))
+            b = resize_frame(frame_b, (ts[0], ts[1]))
+            h, w = ts[:2]
+            output_frame = a.copy() # Start with frame_a
+
+            if self.direction == 'left':
+                offset = int(w * progress)
+                if offset > 0: output_frame[:, :w - offset] = a[:, offset:]; output_frame[:, w - offset:] = b[:, :offset]
+            elif self.direction == 'right':
+                offset = int(w * progress)
+                if offset > 0: output_frame[:, offset:] = a[:, :w - offset]; output_frame[:, :offset] = b[:, w - offset:]
+            elif self.direction == 'up':
+                offset = int(h * progress)
+                if offset > 0: output_frame[:h - offset, :] = a[offset:, :]; output_frame[h - offset:, :] = b[:offset, :]
+            elif self.direction == 'down':
+                offset = int(h * progress)
+                if offset > 0: output_frame[offset:, :] = a[:h - offset, :]; output_frame[:offset, :] = b[h - offset:, :]
+            return output_frame
+        except Exception as e:
+            logger.warning(f"Slide failed: {e}")
+            return frame_b if progress > 0.5 else frame_a
+
+# ========================================================================
+#               Additional Advanced Effects (from video_effectsfinale.py)
+# ========================================================================
+class AdvancedColorGradeEffect(VideoEffect): # Inherits from newly added VideoEffect
+    """
+    A state-of-the-art color grading effect for cinematic, professional music video-grade visuals:
+    - Utilizes CAM16 for perceptually accurate, viewing-condition-aware color adjustments.
+    - Dynamically adapts contrast, brightness, and chroma based on scene content.
+    - Applies non-linear chromatic enhancement for a unique 'glow' effect on vivid colors.
+    - Adds split toning with warm highlights and cool shadows for a stylized look.
+    - Incorporates a perceptual vignette to focus attention on the subject.
+    - Introduces randomized micro-adjustments for an organic, dynamic appearance.
+    """
+    def __init__(self,
+                 base_contrast: float = 1.3,
+                 base_brightness: float = 0.1,
+                 chroma_boost: float = 1.5,
+                 vignette_strength: float = 0.3,
+                 micro_variation: float = 0.02):
+        self.base_contrast = max(0.1, base_contrast)
+        self.base_brightness = base_brightness
+        self.chroma_boost = max(1.0, chroma_boost)
+        self.vignette_strength = max(0.0, min(1.0, vignette_strength))
+        self.micro_variation = max(0.0, micro_variation)
+
+        if not _colour_available: # _colour_available is already defined in video_effectsfinale5.py
+            logger.warning("colour-science not available; falling back to basic color grading for AdvancedColorGrade.")
+        else:
+            # CAM16 viewing conditions for perceptual accuracy.
+            # Ensure colour.appearance and colour.models are accessible
+            try:
+                self.viewing_conditions = colour.appearance.VIEWING_CONDITIONS_CAM16["Average"]
+                self.L_A = 200.0  # Adapting field luminance (cd/m^2).
+                self.Y_b = 20.0   # Background relative luminance.
+            except Exception as e:
+                logger.error(f"Failed to initialize CAM16 settings for AdvancedColorGrade: {e}")
+                # Potentially disable colour-science dependent parts or set a flag
+                self._colour_science_ready = False # Custom flag
+            else:
+                self._colour_science_ready = True
+
+
+    def dynamic_scene_analysis(self, rgb: np.ndarray) -> Tuple[float, float]:
+        """
+        Analyze the scene to determine average luminance and chromatic content.
+        """
+        # Convert linear RGB to XYZ.
+        XYZ = colour.RGB_to_XYZ(
+            rgb,
+            colour.models.RGB_COLOURSPACE_sRGB.whitepoint,
+            colour.models.RGB_COLOURSPACE_sRGB.whitepoint,
+            colour.models.RGB_COLOURSPACE_sRGB.matrix_RGB_to_XYZ
+        )
+        # Convert from XYZ to Oklab.
+        oklab = colour.XYZ_to_Oklab(XYZ)
+        L = oklab[..., 0]  # Lightness.
+        a = oklab[..., 1]
+        b = oklab[..., 2]
+        chroma = np.sqrt(a**2 + b**2)
+
+        avg_luminance = np.mean(L)
+        avg_chroma = np.mean(chroma)
+        return avg_luminance, avg_chroma
+
+    def process(self, frame: np.ndarray, **kwargs) -> np.ndarray:
+        frame = validate_frame(frame)
+        h, w = frame.shape[:2]
+
+        try:
+            if _colour_available and hasattr(self, '_colour_science_ready') and self._colour_science_ready:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                linear_rgb = colour.models.RGB_COLOURSPACE_sRGB.cctf_decoding(rgb)
+                avg_luminance, avg_chroma = self.dynamic_scene_analysis(linear_rgb)
+                XYZ = colour.RGB_to_XYZ(
+                    linear_rgb,
+                    colour.models.RGB_COLOURSPACE_sRGB.whitepoint,
+                    colour.models.RGB_COLOURSPACE_sRGB.whitepoint,
+                    colour.models.RGB_COLOURSPACE_sRGB.matrix_RGB_to_XYZ
+                )
+                cam16 = colour.appearance.XYZ_to_CAM16(XYZ, self.viewing_conditions, L_A=self.L_A, Y_b=self.Y_b)
+                J = cam16.J / 100.0
+                C = cam16.C
+                h_val = cam16.h
+                contrast = self.base_contrast * (1.0 + 0.2 * (1.0 - avg_luminance))
+                brightness_adj = self.base_brightness * (1.0 + 0.3 * (avg_luminance - 0.5)) # Renamed to avoid conflict
+                J = np.clip(contrast * (J - 0.5) + 0.5 + brightness_adj, 0.0, 1.0) * 100.0
+                C = C * (self.chroma_boost + np.tanh(C / 50.0))
+                shadow_mask = 1.0 - (J / 100.0)
+                highlight_mask = J / 100.0
+                h_adjusted = h_val + shadow_mask * 20.0 - highlight_mask * 20.0
+                h_adjusted = h_adjusted % 360.0
+                if self.micro_variation > 0:
+                    J += np.random.uniform(-self.micro_variation, self.micro_variation, (h, w)) * 100.0
+                    C += np.random.uniform(-self.micro_variation * 10, self.micro_variation * 10, (h, w))
+                    J = np.clip(J, 0.0, 100.0)
+                    C = np.clip(C, 0.0, None)
+                x_coords = np.tile(np.linspace(-1, 1, w), (h, 1)) # Renamed to avoid conflict
+                y_coords = np.repeat(np.linspace(-1, 1, h).reshape(-1, 1), w, axis=1) # Renamed to avoid conflict
+                r_dist = np.sqrt(x_coords**2 + y_coords**2) # Renamed to avoid conflict
+                vignette_mask = 1.0 - self.vignette_strength * r_dist # Renamed to avoid conflict
+                J = J * vignette_mask
+                cam16_adjusted = colour.appearance.CAM_Specification_CAM16(J=J, C=C, h=h_adjusted)
+                XYZ_adjusted = colour.appearance.CAM16_to_XYZ(cam16_adjusted, self.viewing_conditions, L_A=self.L_A, Y_b=self.Y_b)
+                rgb_adjusted = colour.XYZ_to_RGB(
+                    XYZ_adjusted,
+                    colour.models.RGB_COLOURSPACE_sRGB.whitepoint,
+                    colour.models.RGB_COLOURSPACE_sRGB.whitepoint,
+                    colour.models.RGB_COLOURSPACE_sRGB.matrix_XYZ_to_RGB
+                )
+                rgb_final = colour.models.RGB_COLOURSPACE_sRGB.cctf_encoding(rgb_adjusted)
+                rgb_final = np.clip(rgb_final, 0.0, 1.0)
+                output = (rgb_final * 255.0).astype(np.uint8)
+                output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+            else:
+                output = frame.astype(np.float32)
+                output = output * self.base_contrast + self.base_brightness * 255.0
+                output = np.clip(output, 0, 255).astype(np.uint8)
+            # cv2.putText(output, "AdvGrade Active", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 215, 0), 2) # Optional: for debugging
+            return output
+        except Exception as e:
+            logger.error(f"AdvancedColorGradeEffect failed: {e}", exc_info=True)
+            return frame
+
+    def reset(self) -> None:
+        pass
+
 def validate_frame(frame: np.ndarray) -> np.ndarray:
     """Ensures the frame is valid (not None, has size) and is uint8 BGR."""
     if frame is None or frame.size == 0:
@@ -364,6 +878,10 @@ def load_sam2_video_predictor(
 
 
 # --- Effect Classes ---
+# Note: The new effect classes (BrightnessContrast, etc.) are defined above.
+# The FrameEffectWrapper might need adjustments later to properly use these class-based effects
+# or a new registry similar to EFFECT_REGISTRY in video_effects.py might be introduced.
+
 class FrameEffectWrapper:
     """Wraps an effect function with enabling/disabling and dependency checks."""
 
@@ -588,6 +1106,13 @@ class PixelSensingEffectRunner:
         self.contrast_factor = 1.0
         self.window_name = "PixelSense FX"
 
+        # Parameters for dataclass effects
+        self.bc_params = {'brightness': 0.0, 'contrast': 1.0, 'gamma': 1.0, 'per_channel': False, 'fade_in': False}
+        self.saturation_params = {'scale': 1.0, 'vibrance': 0.0, 'fade_in': False}
+        self.vignette_params = {'strength': 0.3, 'radius': 0.7, 'falloff': 0.2, 'shape': 'circular', 'color': (0,0,0), 'fade_in': False}
+        self.blur_params = {'kernel_size': 5, 'sigma': 0.0, 'fade_in': False}
+        # For LUT intensity, already have self.lut_intensity
+
         self.goldenaura_variant = 0
         self.goldenaura_variant_names = ["Original", "Enhanced"]
         self.prev_face_pts_gold = np.empty((0, 1, 2), dtype=np.float32)
@@ -764,14 +1289,24 @@ class PixelSensingEffectRunner:
             "led_enhanced": FrameEffectWrapper(self._apply_led_enhanced_style, "led_enhanced", requires_mediapipe=True),
             "led_hue_rotate": FrameEffectWrapper(self._apply_led_hue_rotate_style, "led_hue_rotate", requires_mediapipe=True),
             "goldenaura": FrameEffectWrapper(self._apply_goldenaura_style, "goldenaura", requires_mediapipe=True),
-            "motion_blur": FrameEffectWrapper(self._apply_motion_blur_style, "motion_blur"),
-            "chromatic_aberration": FrameEffectWrapper(self._apply_chromatic_aberration_style, "chromatic_aberration"),
+            "motion_blur": FrameEffectWrapper(self._apply_motion_blur_style, "motion_blur"), # Existing temporal blur
+            "motion_blur_kernel": FrameEffectWrapper(MotionBlurEffect(kernel_size=19).process, "motion_blur_kernel"), # New kernel-based blur
+            "chromatic_aberration": FrameEffectWrapper(ChromaticAberrationEffect(base_strength=0.03, debug_borders=False).process, "chromatic_aberration"), 
+            "advanced_color_grade": FrameEffectWrapper(AdvancedColorGradeEffect().process, "advanced_color_grade", requires_colour=True),
             "lightning": FrameEffectWrapper(self._apply_lightning_cycle, "lightning", requires_mediapipe=True),
             "lut_color_grade": FrameEffectWrapper((self.lut_color_grade_effect.process if self.lut_color_grade_effect else lambda frame, **kw: frame), "lut_color_grade", requires_colour=True),
             "rvm_composite": FrameEffectWrapper(self._apply_rvm_composite_style, "rvm_composite", requires_torch=True),
             "sam_segmentation": FrameEffectWrapper(self._apply_sam_segmentation_style, "sam_segmentation", requires_torch=True, requires_sam=sam1_configured, requires_sam2=sam2_configured_and_valid),
             "neon_glow": FrameEffectWrapper(self._apply_neon_glow_style, "neon_glow", requires_mediapipe=True),
             "particle_trail": FrameEffectWrapper(self._apply_particle_trail_style, "particle_trail", requires_mediapipe=True),
+
+            # Newly integrated dataclass effects
+            "adj_brightness_contrast": FrameEffectWrapper(BrightnessContrast(**self.bc_params).apply, "adj_brightness_contrast"),
+            "adj_saturation": FrameEffectWrapper(Saturation(**self.saturation_params).apply, "adj_saturation"),
+            "adj_vignette": FrameEffectWrapper(Vignette(**self.vignette_params).apply, "adj_vignette"),
+            "adj_blur": FrameEffectWrapper(Blur(**self.blur_params).apply, "adj_blur"),
+            "trans_crossfade": FrameEffectWrapper(Crossfade(duration=1.0).apply, "trans_crossfade"), # Example duration
+            "trans_slide": FrameEffectWrapper(Slide(direction='left', duration=0.5).apply, "trans_slide"), # Example params
         }
         if self.current_effect not in self.effects:
             logger.warning(
@@ -828,179 +1363,212 @@ class PixelSensingEffectRunner:
 
     # --- Effect Implementations ---
 
+    # Updated _apply_led_base_style to align with video_effects.py logic
+    # It will use its internally managed landmarks (lm) and flow (fl, pf) for now.
     def _apply_led_base_style(self, frame: np.ndarray, original_frame: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
         frame = validate_frame(frame)
         original_frame_fallback = original_frame if original_frame is not None else frame.copy()
-        try:
-            if not self.face_mesh or not self.frame_width or not self.frame_height:
-                return original_frame_fallback
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame.flags.writeable = False
-            results = self.face_mesh.process(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frame.flags.writeable = True
-            landmarks = []
-            if results.multi_face_landmarks:
-                landmarks = [(int(lm.x * self.frame_width), int(lm.y * self.frame_height))
-                             for fl in results.multi_face_landmarks for lm in fl.landmark]
-            if not landmarks:
-                self.prev_gray = gray
-                self.prev_landmarks_flow = None
-                return frame
-            frame_out = frame.copy()
-            h, w = frame.shape[:2]
-            if self.prev_gray is not None and self.prev_landmarks_flow is not None and len(self.prev_landmarks_flow) == len(landmarks):
-                curr_pts = np.array(
-                    landmarks, dtype=np.float32).reshape(-1, 1, 2)
-                prev_pts = np.array(self.prev_landmarks_flow,
-                                    dtype=np.float32).reshape(-1, 1, 2)
-                valid_indices = np.where((prev_pts[:, 0, 0] >= 0) & (prev_pts[:, 0, 0] < w) & (
-                    prev_pts[:, 0, 1] >= 0) & (prev_pts[:, 0, 1] < h))[0]
-                if len(valid_indices) > 0:
-                    prev_pts_valid = prev_pts[valid_indices]
-                    try:
-                        flow, status, err = cv2.calcOpticalFlowPyrLK(
-                            self.prev_gray, gray, prev_pts_valid, None, **self.LK_PARAMS)
-                    except cv2.error as e:
-                        logger.warning(f"LK Error: {e}")
-                        flow, status = None, None  # Handle LK error
-                    if flow is not None and status is not None:
-                        good_new = flow[status.flatten() == 1]
-                        good_old = prev_pts_valid[status.flatten() == 1]
-                    if good_new.shape[0] > 0:
-                        frame_out = self._draw_flow_trails_simple(
-                            frame_out, good_new, good_old, (255, 105, 180), (173, 216, 230), 1, 2)
-            self.prev_landmarks_flow = landmarks
-            self.prev_gray = gray.copy()
-        except Exception as e:
-            logger.error(f"Error in led_base: {e}", exc_info=True)
-            self.prev_gray = None
-            self.prev_landmarks_flow = None
-            return original_frame_fallback
-        return frame_out
+        
+        # kwarg extraction similar to video_effects.py _process_frame, adapted for internal state
+        # These would be derived from self.face_mesh.process, self.pose.process, and optical flow calculations
+        # which are typically done before calling an effect method in video_effects.py's PixelSensingEffectRunner.
+        # For video_effectsfinale5.py, these are often done *inside* the effect method.
+        # We will continue this pattern for now but use the logic from video_effects.py's _apply_led_base_style.
 
+        # Simulate kwarg extraction based on typical data flow in video_effectsfinale5.py's _process_frame
+        # before it calls an effect. This is a bit of a hybrid approach.
+        
+        # 1. Get landmarks and flow (specific to how video_effectsfinale5.py currently does it)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb.flags.writeable = False
+        face_results = self.face_mesh.process(frame_rgb) if self.face_mesh else None
+        # pose_results = self.pose.process(frame_rgb) if self.pose else None # Not directly used by this style in ref
+        frame_rgb.flags.writeable = True
+
+        lm = []
+        if face_results and face_results.multi_face_landmarks:
+            for face_landmarks in face_results.multi_face_landmarks:
+                for landmark in face_landmarks.landmark:
+                    if landmark.x is not None and landmark.y is not None:
+                         x, y = int(landmark.x * self.frame_width), int(landmark.y * self.frame_height)
+                         if 0 <= x < self.frame_width and 0 <= y < self.frame_height:
+                            lm.append((x,y))
+        
+        fl, pf = None, None
+        if self.prev_gray is not None and self.prev_landmarks_flow is not None and lm:
+            curr_pts_np = np.array(lm, dtype=np.float32).reshape(-1, 1, 2)
+            # Ensure prev_landmarks_flow is also suitable for calcOpticalFlowPyrLK
+            # It should be a list of tuples, then converted to numpy array
+            if isinstance(self.prev_landmarks_flow, list) and len(self.prev_landmarks_flow) > 0:
+                prev_pts_np = np.array(self.prev_landmarks_flow, dtype=np.float32).reshape(-1, 1, 2)
+                if prev_pts_np.shape[0] > 0 and curr_pts_np.shape[0] == prev_pts_np.shape[0]: # Check for valid shapes
+                    try:
+                        # Using frame_gray (current) and self.prev_gray
+                        flow_calc, status, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, prev_pts_np, None, **self.LK_PARAMS)
+                        if flow_calc is not None and status is not None:
+                            good_new = flow_calc[status.flatten() == 1]
+                            good_old = prev_pts_np[status.flatten() == 1]
+                            if good_new.shape[0] > 0 and good_new.shape == good_old.shape:
+                                fl = good_new.reshape(-1, 1, 2)
+                                pf = good_old.reshape(-1, 1, 2)
+                    except cv2.error as lk_err:
+                        logger.warning(f"LK Optical Flow in _apply_led_base_style failed: {lk_err}")
+                    except Exception as lk_e:
+                         logger.warning(f"LK Optical Flow unexpected error in _apply_led_base_style: {lk_e}")
+        
+        self.prev_gray = gray.copy()
+        self.prev_landmarks_flow = lm # Update for next frame
+
+        # 2. Apply effects as per video_effects.py's _apply_led_base_style
+        proc = frame.copy() # Start with a copy of the current frame
+
+        # Call to _draw_flow_trails_simple (now uses updated version)
+        proc = self._draw_flow_trails_simple(proc, fl, pf) # Uses fl, pf derived above
+
+        # Color overlay
+        try:
+            co = np.full(proc.shape, (30, 0, 90), dtype=np.uint8) # BGR color
+            proc = cv2.addWeighted(proc, 0.85, co, 0.15, 0)
+        except Exception as e:
+            logger.warning(f"LED Base style color overlay failed: {e}")
+        
+        # Call to _draw_motion_glow_separate (now uses updated version)
+        # Pass lm (current landmarks) and the flow data (fl, pf)
+        proc = self._draw_motion_glow_separate(proc, lm, fl, pf) 
+
+        # Call to _apply_distortion (now uses updated version)
+        proc = self._apply_distortion(proc)
+        
+        return proc
+
+
+    # Updated _apply_led_enhanced_style to align with video_effects.py logic
     def _apply_led_enhanced_style(self, frame: np.ndarray, original_frame: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
         frame = validate_frame(frame)
         original_frame_fallback = original_frame if original_frame is not None else frame.copy()
-        try:
-            if not self.face_mesh or not self.frame_width or not self.frame_height:
-                return original_frame_fallback
-            frame_distorted = self._apply_distortion(frame.copy())
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame.flags.writeable = False
-            results = self.face_mesh.process(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frame.flags.writeable = True
-            landmarks = []
-            if results.multi_face_landmarks:
-                landmarks = [(int(lm.x * self.frame_width), int(lm.y * self.frame_height))
-                             for fl in results.multi_face_landmarks for lm in fl.landmark]
-            if not landmarks:
-                self.prev_gray = gray
-                self.prev_landmarks_flow = None
-                return frame_distorted
-            frame_out = frame_distorted.copy()
-            h, w = frame.shape[:2]
-            if self.prev_gray is not None and self.prev_landmarks_flow is not None and len(self.prev_landmarks_flow) == len(landmarks):
-                curr_pts = np.array(
-                    landmarks, dtype=np.float32).reshape(-1, 1, 2)
-                prev_pts = np.array(self.prev_landmarks_flow,
-                                    dtype=np.float32).reshape(-1, 1, 2)
-                valid_indices = np.where((prev_pts[:, 0, 0] >= 0) & (prev_pts[:, 0, 0] < w) & (
-                    prev_pts[:, 0, 1] >= 0) & (prev_pts[:, 0, 1] < h))[0]
-                if len(valid_indices) > 0:
-                    prev_pts_valid = prev_pts[valid_indices]
-                    try:
-                        flow, status, err = cv2.calcOpticalFlowPyrLK(
-                            self.prev_gray, gray, prev_pts_valid, None, **self.LK_PARAMS)
-                    except cv2.error as e:
-                        logger.warning(f"LK Error: {e}")
-                        flow, status = None, None
-                    if flow is not None and status is not None:
-                        good_new = flow[status.flatten() == 1]
-                        good_old = prev_pts_valid[status.flatten() == 1]
-                        if good_new.shape[0] > 0:
-                            for i in range(good_new.shape[0]):
-                                xn, yn = good_new[i].ravel()
-                                xo, yo = good_old[i].ravel()
-                                if 0 <= xn < w and 0 <= yn < h and 0 <= xo < w and 0 <= yo < h:
-                                    pt1 = (int(xo), int(yo))
-                                    pt2 = (int(xn), int(yn))
-                                    cv2.line(frame_out, pt1, pt2,
-                                             (255, 105, 180), 1, cv2.LINE_AA)
-                                    mag = np.linalg.norm(
-                                        good_new[i] - good_old[i])
-                                    gi = min(255, int(mag * 15))
-                                    gc = (gi // 4, gi // 2, gi)
-                                    cv2.circle(frame_out, pt2, 3,
-                                               gc, -1, cv2.LINE_AA)
-            self.prev_landmarks_flow = landmarks
-            self.prev_gray = gray.copy()
-        except Exception as e:
-            logger.error(f"Error in led_enhanced: {e}", exc_info=True)
-            self.prev_gray = None
-            self.prev_landmarks_flow = None
-            return original_frame_fallback
-        return frame_out
+        proc = frame.copy() # Start with a copy
+        h, w = proc.shape[:2]
 
+        # 1. Get landmarks and flow (consistent with how video_effectsfinale5.py currently operates internally for these styles)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb.flags.writeable = False
+        face_results = self.face_mesh.process(frame_rgb) if self.face_mesh else None
+        frame_rgb.flags.writeable = True
+        
+        lm = []
+        if face_results and face_results.multi_face_landmarks:
+            for face_landmarks in face_results.multi_face_landmarks:
+                for landmark_obj in face_landmarks.landmark: # Renamed 'landmark' to 'landmark_obj' to avoid conflict
+                    if landmark_obj.x is not None and landmark_obj.y is not None:
+                         x, y = int(landmark_obj.x * self.frame_width), int(landmark_obj.y * self.frame_height)
+                         if 0 <= x < self.frame_width and 0 <= y < self.frame_height:
+                            lm.append((x,y))
+
+        fl, pf = None, None
+        if self.prev_gray is not None and self.prev_landmarks_flow is not None and lm:
+            curr_pts_np = np.array(lm, dtype=np.float32).reshape(-1, 1, 2)
+            if isinstance(self.prev_landmarks_flow, list) and len(self.prev_landmarks_flow) > 0:
+                prev_pts_np = np.array(self.prev_landmarks_flow, dtype=np.float32).reshape(-1, 1, 2)
+                if prev_pts_np.shape[0] > 0 and curr_pts_np.shape[0] == prev_pts_np.shape[0]:
+                    try:
+                        flow_calc, status, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, prev_pts_np, None, **self.LK_PARAMS)
+                        if flow_calc is not None and status is not None:
+                            good_new = flow_calc[status.flatten() == 1]
+                            good_old = prev_pts_np[status.flatten() == 1]
+                            if good_new.shape[0] > 0 and good_new.shape == good_old.shape:
+                                fl = good_new.reshape(-1, 1, 2)
+                                pf = good_old.reshape(-1, 1, 2)
+                    except cv2.error as lk_err:
+                        logger.warning(f"LK Optical Flow in _apply_led_enhanced_style failed: {lk_err}")
+                    except Exception as lk_e:
+                        logger.warning(f"LK Optical Flow unexpected error in _apply_led_enhanced_style: {lk_e}")
+        
+        self.prev_gray = gray.copy()
+        self.prev_landmarks_flow = lm
+
+        # 2. Apply line drawing and glow as per video_effects.py
+        if fl is not None and pf is not None and fl.shape[0] == pf.shape[0]:
+            try:
+                for i, (new, old) in enumerate(zip(fl, pf)): # Use fl, pf from above
+                    xn, yn = new.ravel()
+                    xo, yo = old.ravel()
+                    if 0 <= xn < w and 0 <= yn < h and 0 <= xo < w and 0 <= yo < h:
+                        cv2.line(proc, (int(xo), int(yo)), (int(xn), int(yn)), (255, 105, 180), 1, cv2.LINE_AA) # Hot pink lines
+                        # Magnitude-based glow
+                        mag = np.linalg.norm(new - old)
+                        gi = min(255, int(mag * 15)) # Glow intensity
+                        gc = (gi // 4, gi // 2, gi) # Glow color (blueish-purple tones)
+                        cv2.circle(proc, (int(xn), int(yn)), 3, gc, -1, cv2.LINE_AA) # Glow dots
+            except Exception as e:
+                logger.warning(f"LED Enhanced style flow draw failed: {e}")
+        
+        # 3. Apply distortion at the end
+        proc = self._apply_distortion(proc)
+        
+        return proc
+
+    # Updated _apply_led_hue_rotate_style to align with video_effects.py logic
     def _apply_led_hue_rotate_style(self, frame: np.ndarray, original_frame: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
         frame = validate_frame(frame)
         original_frame_fallback = original_frame if original_frame is not None else frame.copy()
+        proc = frame.copy()
+
+        # 1. Get landmarks and flow (consistent with how video_effectsfinale5.py currently operates internally)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb.flags.writeable = False
+        face_results = self.face_mesh.process(frame_rgb) if self.face_mesh else None
+        frame_rgb.flags.writeable = True
+
+        lm = []
+        if face_results and face_results.multi_face_landmarks:
+            for face_landmarks in face_results.multi_face_landmarks:
+                for landmark_obj in face_landmarks.landmark:
+                    if landmark_obj.x is not None and landmark_obj.y is not None:
+                        x, y = int(landmark_obj.x * self.frame_width), int(landmark_obj.y * self.frame_height)
+                        if 0 <= x < self.frame_width and 0 <= y < self.frame_height:
+                            lm.append((x,y))
+        
+        fl, pf = None, None
+        if self.prev_gray is not None and self.prev_landmarks_flow is not None and lm:
+            curr_pts_np = np.array(lm, dtype=np.float32).reshape(-1, 1, 2)
+            if isinstance(self.prev_landmarks_flow, list) and len(self.prev_landmarks_flow) > 0:
+                prev_pts_np = np.array(self.prev_landmarks_flow, dtype=np.float32).reshape(-1, 1, 2)
+                if prev_pts_np.shape[0] > 0 and curr_pts_np.shape[0] == prev_pts_np.shape[0]:
+                    try:
+                        flow_calc, status, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, prev_pts_np, None, **self.LK_PARAMS)
+                        if flow_calc is not None and status is not None:
+                            good_new = flow_calc[status.flatten() == 1]
+                            good_old = prev_pts_np[status.flatten() == 1]
+                            if good_new.shape[0] > 0 and good_new.shape == good_old.shape:
+                                fl = good_new.reshape(-1, 1, 2)
+                                pf = good_old.reshape(-1, 1, 2)
+                    except cv2.error as lk_err:
+                        logger.warning(f"LK Optical Flow in _apply_led_hue_rotate_style failed: {lk_err}")
+                    except Exception as lk_e:
+                        logger.warning(f"LK Optical Flow unexpected error in _apply_led_hue_rotate_style: {lk_e}")
+
+        self.prev_gray = gray.copy()
+        self.prev_landmarks_flow = lm
+        
+        # 2. Apply trail, glow, distortion first (using updated helper methods)
+        proc = self._draw_flow_trails_simple(proc, fl, pf) # Uses fl, pf derived above
+        proc = self._draw_motion_glow_separate(proc, lm, fl, pf) # Uses lm, fl, pf
+        proc = self._apply_distortion(proc)
+
+        # 3. Apply Hue Rotation
         try:
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            hsv[:, :, 0] = (hsv[:, :, 0].astype(
-                np.int16) + self.hue_offset) % 180
-            frame_hue = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-            self.hue_offset = (self.hue_offset + 1) % 180
-            frame_with_trails = frame_hue.copy()
-            if self.face_mesh and self.frame_width and self.frame_height:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                frame.flags.writeable = False
-                results = self.face_mesh.process(
-                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                frame.flags.writeable = True
-                landmarks = []
-                if results.multi_face_landmarks:
-                    landmarks = [(int(lm.x * self.frame_width), int(lm.y * self.frame_height))
-                                 for fl in results.multi_face_landmarks for lm in fl.landmark]
-                if not landmarks:
-                    self.prev_gray = gray
-                    self.prev_landmarks_flow = None
-                else:
-                    h, w = frame.shape[:2]
-                    if self.prev_gray is not None and self.prev_landmarks_flow is not None and len(self.prev_landmarks_flow) == len(landmarks):
-                        curr_pts = np.array(
-                            landmarks, dtype=np.float32).reshape(-1, 1, 2)
-                        prev_pts = np.array(
-                            self.prev_landmarks_flow, dtype=np.float32).reshape(-1, 1, 2)
-                        valid_indices = np.where((prev_pts[:, 0, 0] >= 0) & (prev_pts[:, 0, 0] < w) & (
-                            prev_pts[:, 0, 1] >= 0) & (prev_pts[:, 0, 1] < h))[0]
-                        if len(valid_indices) > 0:
-                            prev_pts_valid = prev_pts[valid_indices]
-                            try:
-                                flow, status, err = cv2.calcOpticalFlowPyrLK(
-                                    self.prev_gray, gray, prev_pts_valid, None, **self.LK_PARAMS)
-                            except cv2.error as e:
-                                logger.warning(f"LK Error: {e}")
-                                flow, status = None, None
-                            if flow is not None and status is not None:
-                                good_new = flow[status.flatten() == 1]
-                                good_old = prev_pts_valid[status.flatten(
-                                ) == 1]
-                                if good_new.shape[0] > 0:
-                                    frame_with_trails = self._draw_flow_trails_simple(
-                                        frame_with_trails, good_new, good_old, (255, 69, 0), (255, 215, 0), 1, 2)
-                                    frame_with_trails = self._draw_motion_glow_separate(
-                                        frame_with_trails, landmarks, good_new, good_old)
-                    self.prev_landmarks_flow = landmarks
-                    self.prev_gray = gray.copy()
-            frame_out = self._apply_distortion(frame_with_trails)
+            hsv = cv2.cvtColor(proc, cv2.COLOR_BGR2HSV)
+            hsv[..., 0] = (hsv[..., 0].astype(int) + self.hue_offset) % 180
+            proc = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         except Exception as e:
-            logger.error(f"Error in led_hue_rotate: {e}", exc_info=True)
-            self.prev_gray = None
-            self.prev_landmarks_flow = None
-            return original_frame_fallback
-        return frame_out
+            logger.warning(f"LED Hue rotate style actual hue rotation failed: {e}")
+            return original_frame_fallback # Return original if hue rotation fails
+
+        self.hue_offset = (self.hue_offset + 1) % 180
+        return proc
 
     def _apply_goldenaura_original(self, frame: np.ndarray, frame_time: float, original_frame: np.ndarray, **kwargs) -> np.ndarray:
         frame = validate_frame(frame)
@@ -1017,86 +1585,91 @@ class PixelSensingEffectRunner:
             h, w = frame.shape[:2]
             face_landmarks_current, pose_landmarks_current = [], []
             if results_face.multi_face_landmarks:
-                face_landmarks_current = [(int(lm.x * w), int(lm.y * h))
-                                          for fl in results_face.multi_face_landmarks for lm in fl.landmark]
+                for face_lm_set in results_face.multi_face_landmarks: # Iterate over each detected face
+                    for lm in face_lm_set.landmark: face_landmarks_current.append((int(lm.x * w), int(lm.y * h)))
             if results_pose.pose_landmarks:
-                pose_landmarks_current = [(int(lm.x * w), int(lm.y * h))
-                                          for lm in results_pose.pose_landmarks.landmark if lm.visibility > 0.3]
+                for lm in results_pose.pose_landmarks.landmark:
+                    if lm.visibility > 0.3: pose_landmarks_current.append((int(lm.x * w), int(lm.y * h)))
+            
             overlay = np.zeros_like(frame_out, dtype=np.uint8)
+
+            # Robust Optical Flow Update from video_effectsfinale4.py
             if self.prev_gray is not None:
-                if face_landmarks_current:
-                    curr_pts_face = np.array(
-                        face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                    if self.prev_face_pts_gold.shape[0] == curr_pts_face.shape[0]:
+                # Face
+                if face_landmarks_current and self.prev_face_pts_gold.shape[0] > 0:
+                    curr_pts_face = np.array(face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                    # Ensure shapes are compatible for flow calculation, may need to select corresponding prev_pts if landmark count changes
+                    if curr_pts_face.shape[0] == self.prev_face_pts_gold.shape[0]:
                         try:
-                            flow_face, status_face, _ = cv2.calcOpticalFlowPyrLK(
-                                self.prev_gray, gray, self.prev_face_pts_gold, curr_pts_face, **self.LK_PARAMS_GOLD)
-                        except cv2.error:
-                            flow_face, status_face = None, None
-                        if flow_face is not None and status_face is not None:
-                            good_new = flow_face[status_face.flatten() == 1]
-                            good_old = self.prev_face_pts_gold[status_face.flatten(
-                            ) == 1]
-                            self.prev_face_pts_gold = good_new.reshape(
-                                -1, 1, 2) if good_new.size > 0 else np.empty((0, 1, 2), dtype=np.float32)
-                            self.face_history.append(
-                                (good_new, good_old)) if good_new.shape[0] > 0 else None
-                        else:
-                            self.face_history.clear()
-                            self.prev_face_pts_gold = curr_pts_face
-                    else:
-                        self.face_history.clear()
-                        self.prev_face_pts_gold = curr_pts_face
-                else:
+                            flow_face, status_face, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.prev_face_pts_gold, curr_pts_face, **self.LK_PARAMS_GOLD)
+                            if flow_face is not None and status_face is not None:
+                                good_new = flow_face[status_face.flatten() == 1]
+                                good_old = self.prev_face_pts_gold[status_face.flatten() == 1]
+                                if good_new.shape[0] > 0: self.face_history.append((good_new, good_old))
+                                self.prev_face_pts_gold = good_new.reshape(-1, 1, 2) if good_new.shape[0] > 0 else np.empty((0, 1, 2), dtype=np.float32)
+                            else: # Flow failed
+                                self.face_history.clear()
+                                self.prev_face_pts_gold = curr_pts_face # Re-init with current points
+                        except cv2.error as cv_err: logger.warning(f"GO_Orig face LK failed: {cv_err}"); self.face_history.clear(); self.prev_face_pts_gold = curr_pts_face
+                    else: # Landmark count changed
+                         self.face_history.clear(); self.prev_face_pts_gold = curr_pts_face
+                elif face_landmarks_current: # No previous points, but current points exist
+                    self.prev_face_pts_gold = np.array(face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
                     self.face_history.clear()
-                    self.prev_face_pts_gold = np.empty(
-                        (0, 1, 2), dtype=np.float32)
-                if pose_landmarks_current:
-                    curr_pts_pose = np.array(
-                        pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                    if self.prev_pose_pts_gold.shape[0] == curr_pts_pose.shape[0]:
+                else: # No current face landmarks
+                    self.prev_face_pts_gold = np.empty((0, 1, 2), dtype=np.float32)
+                    self.face_history.clear()
+
+                # Pose
+                if pose_landmarks_current and self.prev_pose_pts_gold.shape[0] > 0:
+                    curr_pts_pose = np.array(pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                    if curr_pts_pose.shape[0] == self.prev_pose_pts_gold.shape[0]:
                         try:
-                            flow_pose, status_pose, _ = cv2.calcOpticalFlowPyrLK(
-                                self.prev_gray, gray, self.prev_pose_pts_gold, curr_pts_pose, **self.LK_PARAMS_GOLD)
-                        except cv2.error:
-                            flow_pose, status_pose = None, None
-                        if flow_pose is not None and status_pose is not None:
-                            good_new_pose = flow_pose[status_pose.flatten(
-                            ) == 1]
-                            good_old_pose = self.prev_pose_pts_gold[status_pose.flatten(
-                            ) == 1]
-                            self.prev_pose_pts_gold = good_new_pose.reshape(
-                                -1, 1, 2) if good_new_pose.size > 0 else np.empty((0, 1, 2), dtype=np.float32)
-                            self.pose_history.append(
-                                (good_new_pose, good_old_pose)) if good_new_pose.shape[0] > 0 else None
-                        else:
-                            self.pose_history.clear()
-                            self.prev_pose_pts_gold = curr_pts_pose
-                    else:
-                        self.pose_history.clear()
-                        self.prev_pose_pts_gold = curr_pts_pose
-                else:
+                            flow_pose, status_pose, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.prev_pose_pts_gold, curr_pts_pose, **self.LK_PARAMS_GOLD)
+                            if flow_pose is not None and status_pose is not None:
+                                good_new_pose = flow_pose[status_pose.flatten() == 1]
+                                good_old_pose = self.prev_pose_pts_gold[status_pose.flatten() == 1]
+                                if good_new_pose.shape[0] > 0: self.pose_history.append((good_new_pose, good_old_pose))
+                                self.prev_pose_pts_gold = good_new_pose.reshape(-1, 1, 2) if good_new_pose.shape[0] > 0 else np.empty((0, 1, 2), dtype=np.float32)
+                            else: # Flow failed
+                                self.pose_history.clear(); self.prev_pose_pts_gold = curr_pts_pose
+                        except cv2.error as cv_err: logger.warning(f"GO_Orig pose LK failed: {cv_err}"); self.pose_history.clear(); self.prev_pose_pts_gold = curr_pts_pose
+                    else: # Landmark count changed
+                        self.pose_history.clear(); self.prev_pose_pts_gold = curr_pts_pose
+                elif pose_landmarks_current: # No previous points, but current points exist
+                    self.prev_pose_pts_gold = np.array(pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
                     self.pose_history.clear()
-                    self.prev_pose_pts_gold = np.empty(
-                        (0, 1, 2), dtype=np.float32)
-            else:
-                if face_landmarks_current:
-                    self.prev_face_pts_gold = np.array(
-                        face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                if pose_landmarks_current:
-                    self.prev_pose_pts_gold = np.array(
-                        pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                self.face_history.clear()
-                self.pose_history.clear()
+                else: # No current pose landmarks
+                    self.prev_pose_pts_gold = np.empty((0, 1, 2), dtype=np.float32)
+                    self.pose_history.clear()
+            else: # No previous gray frame
+                 if face_landmarks_current: self.prev_face_pts_gold = np.array(face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                 if pose_landmarks_current: self.prev_pose_pts_gold = np.array(pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                 self.face_history.clear(); self.pose_history.clear()
+
+            # Draw Trails (logic from video_effectsfinale4.py)
             if self.face_history:
-                max_idx = max(len(self.face_history) - 1, 1)
-                [overlay := self._draw_flow_trails_simple(overlay, flow, prev, tuple(int(c * (TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in GOLD_TINT_COLOR), tuple(
-                    int(c * (TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in GOLD_TINT_COLOR), 1, TRAIL_RADIUS) for idx, (flow, prev) in enumerate(reversed(self.face_history))]
+                num_face_hist = len(self.face_history)
+                max_idx_face = max(num_face_hist - 1, 1)
+                for idx, item_hist in enumerate(reversed(self.face_history)): # Iterate in reverse for older trails first
+                    if isinstance(item_hist, tuple) and len(item_hist) == 2 and item_hist[0].shape[0] > 0 and item_hist[0].shape[0] == item_hist[1].shape[0]:
+                        flow_hist, prev_hist = item_hist
+                        alpha_hist = TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx_face)
+                        color_hist = tuple(int(c_val * alpha_hist) for c_val in GOLD_TINT_COLOR)
+                        overlay = self._draw_flow_trails_simple(overlay, flow_hist, prev_hist, color_hist, color_hist, 1, TRAIL_RADIUS)
             if self.pose_history:
-                max_idx = max(len(self.pose_history) - 1, 1)
-                [overlay := self._draw_flow_trails_simple(overlay, flow, prev, tuple(int(c * (TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in GOLD_TINT_COLOR), tuple(
-                    int(c * (TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in GOLD_TINT_COLOR), 1, TRAIL_RADIUS) for idx, (flow, prev) in enumerate(reversed(self.pose_history))]
-            frame_out = cv2.add(frame_out, overlay)
+                num_pose_hist = len(self.pose_history)
+                max_idx_pose = max(num_pose_hist - 1, 1)
+                for idx, item_hist in enumerate(reversed(self.pose_history)):
+                     if isinstance(item_hist, tuple) and len(item_hist) == 2 and item_hist[0].shape[0] > 0 and item_hist[0].shape[0] == item_hist[1].shape[0]:
+                        flow_hist, prev_hist = item_hist
+                        alpha_hist = TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx_pose)
+                        color_hist = tuple(int(c_val * alpha_hist) for c_val in GOLD_TINT_COLOR)
+                        overlay = self._draw_flow_trails_simple(overlay, flow_hist, prev_hist, color_hist, color_hist, 1, TRAIL_RADIUS)
+            
+            frame_out = cv2.add(frame_out, overlay) # Add trails to the output frame
+
+            # Apply Tint
             tint_layer = np.full_like(
                 frame_out, GOLD_TINT_COLOR, dtype=np.uint8)
             frame_out = cv2.addWeighted(
@@ -1150,93 +1723,81 @@ class PixelSensingEffectRunner:
             h, w = frame.shape[:2]
             face_landmarks_current, pose_landmarks_current = [], []
             if results_face.multi_face_landmarks:
-                face_landmarks_current = [(int(lm.x * w), int(lm.y * h))
-                                          for fl in results_face.multi_face_landmarks for lm in fl.landmark]
+                for face_lm_set in results_face.multi_face_landmarks:
+                    for lm in face_lm_set.landmark: face_landmarks_current.append((int(lm.x * w), int(lm.y * h)))
             if results_pose.pose_landmarks:
-                pose_landmarks_current = [(int(lm.x * w), int(lm.y * h))
-                                          for lm in results_pose.pose_landmarks.landmark if lm.visibility > 0.3]
+                for lm in results_pose.pose_landmarks.landmark:
+                    if lm.visibility > 0.3: pose_landmarks_current.append((int(lm.x * w), int(lm.y * h)))
+            
             overlay = np.zeros_like(frame_out, dtype=np.uint8)
+
+            # Robust Optical Flow Update (similar to _apply_goldenaura_original, using logic from video_effectsfinale4.py)
             if self.prev_gray is not None:
-                if face_landmarks_current:
-                    curr_pts_face = np.array(
-                        face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                    if self.prev_face_pts_gold.shape[0] == curr_pts_face.shape[0]:
+                # Face
+                if face_landmarks_current and self.prev_face_pts_gold.shape[0] > 0:
+                    curr_pts_face = np.array(face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                    if curr_pts_face.shape[0] == self.prev_face_pts_gold.shape[0]:
                         try:
-                            flow_face, status_face, _ = cv2.calcOpticalFlowPyrLK(
-                                self.prev_gray, gray, self.prev_face_pts_gold, curr_pts_face, **self.LK_PARAMS_GOLD)
-                        except cv2.error:
-                            flow_face, status_face = None, None
-                        if flow_face is not None and status_face is not None:
-                            good_new = flow_face[status_face.flatten() == 1]
-                            good_old = self.prev_face_pts_gold[status_face.flatten(
-                            ) == 1]
-                            self.prev_face_pts_gold = good_new.reshape(
-                                -1, 1, 2) if good_new.size > 0 else np.empty((0, 1, 2), dtype=np.float32)
-                            self.face_history.append(
-                                (good_new, good_old)) if good_new.shape[0] > 0 else None
-                        else:
-                            self.face_history.clear()
-                            self.prev_face_pts_gold = curr_pts_face
-                    else:
-                        self.face_history.clear()
-                        self.prev_face_pts_gold = curr_pts_face
-                else:
-                    self.face_history.clear()
-                    self.prev_face_pts_gold = np.empty(
-                        (0, 1, 2), dtype=np.float32)
-                if pose_landmarks_current:
-                    curr_pts_pose = np.array(
-                        pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                    if self.prev_pose_pts_gold.shape[0] == curr_pts_pose.shape[0]:
+                            flow_face, status_face, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.prev_face_pts_gold, curr_pts_face, **self.LK_PARAMS_GOLD)
+                            if flow_face is not None and status_face is not None:
+                                good_new = flow_face[status_face.flatten() == 1]
+                                good_old = self.prev_face_pts_gold[status_face.flatten() == 1]
+                                if good_new.shape[0] > 0: self.face_history.append((good_new, good_old))
+                                self.prev_face_pts_gold = good_new.reshape(-1, 1, 2) if good_new.shape[0] > 0 else np.empty((0, 1, 2), dtype=np.float32)
+                            else: self.face_history.clear(); self.prev_face_pts_gold = curr_pts_face
+                        except cv2.error as cv_err: logger.warning(f"GO_Enh face LK failed: {cv_err}"); self.face_history.clear(); self.prev_face_pts_gold = curr_pts_face
+                    else: self.face_history.clear(); self.prev_face_pts_gold = curr_pts_face
+                elif face_landmarks_current: self.prev_face_pts_gold = np.array(face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2); self.face_history.clear()
+                else: self.prev_face_pts_gold = np.empty((0, 1, 2), dtype=np.float32); self.face_history.clear()
+
+                # Pose
+                if pose_landmarks_current and self.prev_pose_pts_gold.shape[0] > 0:
+                    curr_pts_pose = np.array(pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                    if curr_pts_pose.shape[0] == self.prev_pose_pts_gold.shape[0]:
                         try:
-                            flow_pose, status_pose, _ = cv2.calcOpticalFlowPyrLK(
-                                self.prev_gray, gray, self.prev_pose_pts_gold, curr_pts_pose, **self.LK_PARAMS_GOLD)
-                        except cv2.error:
-                            flow_pose, status_pose = None, None
-                        if flow_pose is not None and status_pose is not None:
-                            good_new_pose = flow_pose[status_pose.flatten(
-                            ) == 1]
-                            good_old_pose = self.prev_pose_pts_gold[status_pose.flatten(
-                            ) == 1]
-                            self.prev_pose_pts_gold = good_new_pose.reshape(
-                                -1, 1, 2) if good_new_pose.size > 0 else np.empty((0, 1, 2), dtype=np.float32)
-                            self.pose_history.append(
-                                (good_new_pose, good_old_pose)) if good_new_pose.shape[0] > 0 else None
-                        else:
-                            self.pose_history.clear()
-                            self.prev_pose_pts_gold = curr_pts_pose
-                    else:
-                        self.pose_history.clear()
-                        self.prev_pose_pts_gold = curr_pts_pose
-                else:
-                    self.pose_history.clear()
-                    self.prev_pose_pts_gold = np.empty(
-                        (0, 1, 2), dtype=np.float32)
-            else:
-                if face_landmarks_current:
-                    self.prev_face_pts_gold = np.array(
-                        face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                if pose_landmarks_current:
-                    self.prev_pose_pts_gold = np.array(
-                        pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
-                self.face_history.clear()
-                self.pose_history.clear()
-            dynamic_glow_factor = 0.7 + 0.3 * math.sin(frame_time * 1.5)
-            enhanced_tint_color_base = np.array([30, 180, 220])
-            enhanced_tint_color = tuple(
-                np.clip(enhanced_tint_color_base * dynamic_glow_factor, 0, 255).astype(int))
-            line_thickness_face, dot_radius_face = 2, 3
+                            flow_pose, status_pose, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.prev_pose_pts_gold, curr_pts_pose, **self.LK_PARAMS_GOLD)
+                            if flow_pose is not None and status_pose is not None:
+                                good_new_pose = flow_pose[status_pose.flatten() == 1]
+                                good_old_pose = self.prev_pose_pts_gold[status_pose.flatten() == 1]
+                                if good_new_pose.shape[0] > 0: self.pose_history.append((good_new_pose, good_old_pose))
+                                self.prev_pose_pts_gold = good_new_pose.reshape(-1, 1, 2) if good_new_pose.shape[0] > 0 else np.empty((0, 1, 2), dtype=np.float32)
+                            else: self.pose_history.clear(); self.prev_pose_pts_gold = curr_pts_pose
+                        except cv2.error as cv_err: logger.warning(f"GO_Enh pose LK failed: {cv_err}"); self.pose_history.clear(); self.prev_pose_pts_gold = curr_pts_pose
+                    else: self.pose_history.clear(); self.prev_pose_pts_gold = curr_pts_pose
+                elif pose_landmarks_current: self.prev_pose_pts_gold = np.array(pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2); self.pose_history.clear()
+                else: self.prev_pose_pts_gold = np.empty((0, 1, 2), dtype=np.float32); self.pose_history.clear()
+            else: # No previous gray frame
+                 if face_landmarks_current: self.prev_face_pts_gold = np.array(face_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                 if pose_landmarks_current: self.prev_pose_pts_gold = np.array(pose_landmarks_current, dtype=np.float32).reshape(-1, 1, 2)
+                 self.face_history.clear(); self.pose_history.clear()
+
+            # Enhanced Drawing Params (from video_effectsfinale4.py)
+            dynamic_glow_factor = 0.7 + 0.3 * math.sin(frame_time * 1.5) # Pulsating effect
+            enhanced_tint_color_base = np.array([30, 180, 220]) # Slightly different gold/amber
+            enhanced_tint_color = tuple(np.clip(enhanced_tint_color_base * dynamic_glow_factor, 0, 255).astype(int))
+            line_thickness_face, dot_radius_face = 2, 3 # Thicker trails
             line_thickness_pose, dot_radius_pose = 3, 4
+
+            # Draw Trails (using enhanced params)
             if self.face_history:
-                max_idx = max(len(self.face_history) - 1, 1)
-                [overlay := self._draw_flow_trails_simple(overlay, flow, prev, tuple(int(c * (TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in enhanced_tint_color), tuple(int(c * (
-                    TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in enhanced_tint_color), line_thickness_face, dot_radius_face) for idx, (flow, prev) in enumerate(reversed(self.face_history))]
+                num_face_hist = len(self.face_history); max_idx_face = max(num_face_hist - 1, 1)
+                for idx, item_hist in enumerate(reversed(self.face_history)):
+                    if isinstance(item_hist, tuple) and len(item_hist) == 2 and item_hist[0].shape[0] > 0 and item_hist[0].shape[0] == item_hist[1].shape[0]:
+                        flow_hist, prev_hist = item_hist; alpha_hist = TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx_face)
+                        color_hist = tuple(int(c_val * alpha_hist) for c_val in enhanced_tint_color)
+                        overlay = self._draw_flow_trails_simple(overlay, flow_hist, prev_hist, color_hist, color_hist, line_thickness_face, dot_radius_face)
             if self.pose_history:
-                max_idx = max(len(self.pose_history) - 1, 1)
-                [overlay := self._draw_flow_trails_simple(overlay, flow, prev, tuple(int(c * (TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in enhanced_tint_color), tuple(int(c * (
-                    TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx))) for c in enhanced_tint_color), line_thickness_pose, dot_radius_pose) for idx, (flow, prev) in enumerate(reversed(self.pose_history))]
+                num_pose_hist = len(self.pose_history); max_idx_pose = max(num_pose_hist - 1, 1)
+                for idx, item_hist in enumerate(reversed(self.pose_history)):
+                     if isinstance(item_hist, tuple) and len(item_hist) == 2 and item_hist[0].shape[0] > 0 and item_hist[0].shape[0] == item_hist[1].shape[0]:
+                        flow_hist, prev_hist = item_hist; alpha_hist = TRAIL_END_ALPHA + (TRAIL_START_ALPHA - TRAIL_END_ALPHA) * (idx / max_idx_pose)
+                        color_hist = tuple(int(c_val * alpha_hist) for c_val in enhanced_tint_color)
+                        overlay = self._draw_flow_trails_simple(overlay, flow_hist, prev_hist, color_hist, color_hist, line_thickness_pose, dot_radius_pose)
+            
             frame_out = cv2.add(frame_out, overlay)
-            tint_strength_enhanced = min(1.0, TINT_STRENGTH * 1.2)
+
+            # Apply Enhanced Tint
+            tint_strength_enhanced = min(1.0, TINT_STRENGTH * 1.2) # Slightly stronger tint
             tint_layer_enhanced = np.full_like(
                 frame_out, enhanced_tint_color, dtype=np.uint8)
             frame_out = cv2.addWeighted(
@@ -1290,6 +1851,7 @@ class PixelSensingEffectRunner:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, )
         return frame_out
 
+    # _apply_motion_blur_style will be removed/replaced next
     def _apply_motion_blur_style(self, frame: np.ndarray, original_frame: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
         frame = validate_frame(frame)
         original_frame_fallback = original_frame if original_frame is not None else frame.copy()
@@ -1307,48 +1869,8 @@ class PixelSensingEffectRunner:
             logger.error(f"Error calculating motion blur avg: {e}")
             self.frame_buffer.clear()
             return original_frame_fallback
-        return frame_out
-
-    def _apply_chromatic_aberration_style(self, frame: np.ndarray, original_frame: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
-        frame = validate_frame(frame)
-        original_frame_fallback = original_frame if original_frame is not None else frame.copy()
-        try:
-            base_strength = 0.05
-            non_linear_exponent = 3.0
-            edge_boost = 4.0
-            h, w = frame.shape[:2]
-            cx, cy = w / 2.0, h / 2.0
-            map_x = np.tile(np.arange(w, dtype=np.float32), (h, 1))
-            map_y = np.repeat(
-                np.arange(h, dtype=np.float32).reshape(-1, 1), w, axis=1)
-            delta_x = map_x - cx
-            delta_y = map_y - cy
-            r = np.sqrt(delta_x**2 + delta_y**2)
-            r_max = max(np.sqrt(cx**2 + cy**2),
-                        np.sqrt((w - cx)**2 + (h - cy)**2), 1e-6)
-            r_normalized = r / r_max
-            non_linear_factor = edge_boost * \
-                (r_normalized ** non_linear_exponent)
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(
-                np.float32) / 255.0
-            saturation = hsv[..., 1]
-            k_map = base_strength * (1.5 + saturation)
-            scale_r = 1.0 + k_map * non_linear_factor
-            scale_b = 1.0 - k_map * non_linear_factor
-            map_x_r = np.clip(cx + delta_x * scale_r, 0, w - 1)
-            map_y_r = np.clip(cy + delta_y * scale_r, 0, h - 1)
-            map_x_b = np.clip(cx + delta_x * scale_b, 0, w - 1)
-            map_y_b = np.clip(cy + delta_y * scale_b, 0, h - 1)
-            b, g, r_chan = cv2.split(frame)
-            r_shifted = cv2.remap(
-                r_chan, map_x_r, map_y_r, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            b_shifted = cv2.remap(
-                b, map_x_b, map_y_b, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            frame_out = cv2.merge((b_shifted, g, r_shifted))
-        except Exception as e:
-            logger.error(f"Chromatic Aberration failed: {e}")
-            frame_out = original_frame_fallback
-        return frame_out
+    # This _apply_chromatic_aberration_style method will be removed.
+    # The ChromaticAberrationEffect class is defined above.
 
     def _apply_lightning_style_random(self, frame: np.ndarray, original_frame: Optional[np.ndarray] = None, **kwargs) -> np.ndarray:
         frame = validate_frame(frame)
@@ -1872,26 +2394,66 @@ class PixelSensingEffectRunner:
                 frame, (255, 255, 255), dtype=np.float32)
             frame_float = frame.astype(np.float32)
             frame_float = (frame_float * (1.0 - glow_alpha_3c) +
-                           glow_color_layer * glow_alpha_3c)
-            frame = np.clip(frame_float, 0, 255).astype(np.uint8)
+                          glow_color_layer * glow_alpha_3c) # This was part of the old _draw_motion_glow_separate
+            frame = np.clip(frame_float, 0, 255).astype(np.uint8) # This was part of the old _draw_motion_glow_separate
         except Exception as e:
-            logger.warning(f"Draw motion glow failed: {e}", exc_info=False)
+            logger.warning(f"Draw motion glow failed: {e}", exc_info=False) # This was part of the old _draw_motion_glow_separate
+        return frame # This was part of the old _draw_motion_glow_separate
+
+    # Updated _draw_motion_glow_separate to match video_effects.py
+    def _draw_motion_glow_separate(self, frame: np.ndarray, landmarks: List[Tuple[int, int]], flow: Optional[np.ndarray], prev_pts: Optional[np.ndarray]) -> np.ndarray:
+        frame = validate_frame(frame)
+        num_landmarks = len(landmarks)
+        if num_landmarks == 0:
+            return frame
+        
+        magnitudes = np.zeros(num_landmarks)
+        try:
+            if flow is not None and prev_pts is not None and flow.shape[0] == prev_pts.shape[0] and prev_pts.shape[0] == num_landmarks:
+                # Ensure flow and prev_pts are correctly shaped for subtraction if they are (N, 1, 2)
+                flow_reshaped = flow.reshape(-1, 2)
+                prev_pts_reshaped = prev_pts.reshape(-1, 2)
+                magnitudes = np.linalg.norm(flow_reshaped - prev_pts_reshaped, axis=1)
+            elif flow is not None and prev_pts is not None and flow.shape[0] > 0: # If landmark count mismatch, use average
+                flow_reshaped = flow.reshape(-1, 2)
+                prev_pts_reshaped = prev_pts.reshape(-1, 2)
+                if flow_reshaped.shape[0] == prev_pts_reshaped.shape[0] and flow_reshaped.shape[0] > 0: # Check if shapes match for avg calc
+                    avg_mag = np.mean(np.linalg.norm(flow_reshaped - prev_pts_reshaped, axis=1))
+                    magnitudes = np.full(num_landmarks, avg_mag)
+                else: # Fallback if shapes still mismatch for avg calc
+                    logger.debug("Flow and prev_pts shape mismatch for average magnitude calculation.")
+                    # Keep magnitudes as zeros, so no glow if points don't align
+        except Exception as e:
+            logger.debug(f"Glow magnitude calc failed: {e}")
+            # Keep magnitudes as zeros
+
+        h, w = frame.shape[:2]
+        try:
+            for i, (x, y) in enumerate(landmarks):
+                if i < len(magnitudes): # Ensure index is within bounds for magnitudes
+                    glow_intensity = min(255, int(magnitudes[i] * 15)) # As per video_effects.py
+                    glow_color = (glow_intensity // 3, glow_intensity // 2, glow_intensity) # As per video_effects.py
+                    if 0 <= x < w and 0 <= y < h:
+                        cv2.circle(frame, (x, y), 5, glow_color, -1, cv2.LINE_AA)
+                else: # Should not happen if logic is correct, but as a safeguard
+                    logger.debug(f"Landmark index {i} out of bounds for magnitudes array (len: {len(magnitudes)})")
+
+        except Exception as e:
+            logger.warning(f"Draw motion glow failed: {e}")
+            return frame
         return frame
 
+    # Updated _apply_distortion to match video_effects.py
     def _apply_distortion(self, frame: np.ndarray) -> np.ndarray:
-        """Applies a subtle barrel distortion effect."""
+        """Applies a horizontal sine wave distortion effect to the frame."""
         frame = validate_frame(frame)
         try:
-            h, w = frame.shape[:2]
-            cx, cy = w / 2, h / 2
-            k1 = 0.0000001
-            k2 = 0.0
-            p1 = 0.0
-            p2 = 0.0
-            cam_matrix = np.array(
-                [[w, 0, cx], [0, h, cy], [0, 0, 1]], dtype=np.float32)
-            dist_coeffs = np.array([k1, k2, p1, p2], dtype=np.float32)
-            return cv2.undistort(frame, cam_matrix, dist_coeffs, None, cam_matrix)
+            rows, cols, _ = frame.shape
+            map_x, map_y = np.meshgrid(np.arange(cols), np.arange(rows))
+            distort_x = np.sin(map_y / 20.0) * 5.0 # Sine wave distortion
+            map_x = np.clip(map_x + distort_x, 0, cols - 1).astype(np.float32)
+            map_y = map_y.astype(np.float32) # Y map remains unchanged for this specific distortion
+            return cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR)
         except Exception as e:
             logger.warning(f"Distortion effect failed: {e}")
             return frame
@@ -2087,13 +2649,26 @@ class PixelSensingEffectRunner:
 
             if self.display:
                 cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
-                cv2.createTrackbar("Brightness", self.window_name, 100, 200, lambda x: setattr(
-                    self, "brightness_factor", (x - 100) / 100.0), )
-                cv2.createTrackbar("Contrast", self.window_name, 100, 200, lambda x: setattr(
-                    self, "contrast_factor", x / 100.0), )
-                cv2.createTrackbar("LUT Intensity", self.window_name, 100, 100, lambda x: setattr(
-                    self, "lut_intensity", x / 100.0), )
-                logger.info("Display window initialized.")
+                cv2.createTrackbar("Brightness", self.window_name, 100, 200, lambda x: self.bc_params.update({'brightness': (x - 100) / 100.0}))
+                cv2.createTrackbar("Contrast", self.window_name, 100, 200, lambda x: self.bc_params.update({'contrast': x / 100.0}))
+                cv2.createTrackbar("Gamma", self.window_name, 33, 100, lambda x: self.bc_params.update({'gamma': x / 33.0 if x > 0 else 0.1})) # Map 33 to 1.0 gamma
+                
+                cv2.createTrackbar("Sat. Scale", self.window_name, 100, 200, lambda x: self.saturation_params.update({'scale': x / 100.0}))
+                cv2.createTrackbar("Vibrance", self.window_name, 0, 100, lambda x: self.saturation_params.update({'vibrance': x / 100.0}))
+                
+                cv2.createTrackbar("Vign. Strength", self.window_name, 30, 100, lambda x: self.vignette_params.update({'strength': x / 100.0}))
+                cv2.createTrackbar("Vign. Radius", self.window_name, 70, 100, lambda x: self.vignette_params.update({'radius': x / 100.0}))
+                # Vignette falloff, shape, color deferred for trackbar simplicity
+
+                # Kernel size must be odd. Trackbar range 3-51, step 2. Default 5.
+                cv2.createTrackbar("Blur Kernel", self.window_name, 2, 24, lambda x: self.blur_params.update({'kernel_size': x * 2 + 1})) # (0*2+1=1 -> bad, 1*2+1=3, 2*2+1=5 ... 24*2+1=49)
+                                                                                                                                         # Correcting lambda for blur_kernel to ensure it starts at 3
+                cv2.setTrackbarMin("Blur Kernel", self.window_name, 1) # Min val 1 means 1*2+1 = 3
+                cv2.setTrackbarPos("Blur Kernel", self.window_name, 2) # Initial position for kernel size 5 (2*2+1)
+
+
+                cv2.createTrackbar("LUT Intensity", self.window_name, 100, 100, lambda x: setattr(self, "lut_intensity", x / 100.0))
+                logger.info("Display window initialized with all trackbars.")
             return True
         except Exception as e:
             logger.error(f"Capture init failed: {e}", exc_info=True)

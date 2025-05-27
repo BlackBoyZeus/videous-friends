@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import os
@@ -584,6 +583,10 @@ class PixelSensingEffectRunner:
         self.error_count = 0
         self.current_effect = "sam_segmentation"  # Default to SAM
         self.use_sam2_runtime = False  # Updated after config/loading
+        self.sam2_segmentation_mode = "center_prompt" # "center_prompt", "full_frame", or "interactive_prompt"
+        self.sam_interactive_points = [] # Stores (x,y) tuples for display coordinates
+        self.sam_interactive_labels = [] # Stores 0 or 1 for corresponding points
+        self.sam_interactive_points_cleared_once = False # For logging guide message
         self.brightness_factor = 0.0
         self.contrast_factor = 1.0
         self.window_name = "PixelSense FX"
@@ -1744,6 +1747,11 @@ class PixelSensingEffectRunner:
             return original_frame_fallback
 
         sam_version_name = "SAM v2 (Ultralytics)" if use_v2 else "SAM v1 (AutoMask)"
+        if use_v2:
+            mode_display_name = self.sam2_segmentation_mode
+            if self.sam2_segmentation_mode == "interactive_prompt":
+                mode_display_name += f" ({len(self.sam_interactive_points)}pts)"
+            sam_version_name += f" ({mode_display_name})"
         sam_model_to_use = self.sam_model_v2 if use_v2 else self.sam_model_v1
         logger.debug(f"Attempting SAM segmentation using {sam_version_name}")
 
@@ -1752,33 +1760,77 @@ class PixelSensingEffectRunner:
             combined_mask_resized = None
 
             if use_v2:
-                scale_factor = 0.5
+                scale_factor = 0.5 # Downscaling for SAM v2 model input
                 small_h, small_w = int(h * scale_factor), int(w * scale_factor)
                 small_frame = cv2.resize(frame, (small_w, small_h))
                 small_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                logger.debug(
-                    f"SAM v2 using downsampled frame: {small_rgb.shape}")
-                center_point = [small_w // 2, small_h // 2]
-                logger.debug(
-                    f"SAM v2 using center point prompt: {center_point}")
+                logger.debug(f"SAM v2 ({self.sam2_segmentation_mode}) using downscaled frame: {small_rgb.shape}")
+
+                results = None
+                prompt_points_for_model = None
+                prompt_labels_for_model = None
+
+                if self.sam2_segmentation_mode == "center_prompt":
+                    prompt_points_for_model = [[small_w // 2, small_h // 2]]
+                    prompt_labels_for_model = [1]
+                    logger.debug(f"SAM v2 using center point prompt: {prompt_points_for_model}")
+                elif self.sam2_segmentation_mode == "full_frame":
+                    logger.debug("SAM v2 using full_frame (prompt-less) segmentation.")
+                    # No points/labels needed
+                elif self.sam2_segmentation_mode == "interactive_prompt":
+                    if not self.sam_interactive_points:
+                        # Log only once after clearing or initial state to avoid spamming logs
+                        if not self.sam_interactive_points_cleared_once: 
+                            logger.info("SAM v2 interactive: No points. Click L/R mouse for +/- prompts. 'c' to clear.")
+                            self.sam_interactive_points_cleared_once = True 
+                        # Display message on screen and return original frame
+                        cv2.putText(original_frame_fallback, "Interactive: Click L/R for +/- points. 'c' to clear.",
+                                    (10, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 200, 255), 1)
+                        return original_frame_fallback # Don't run SAM, return frame with message
+                    
+                    # Transform display coordinates to model (downscaled) coordinates
+                    prompt_points_for_model = [[int(pt[0] * scale_factor), int(pt[1] * scale_factor)] for pt in self.sam_interactive_points]
+                    prompt_labels_for_model = list(self.sam_interactive_labels) # Ensure it's a mutable list
+                    logger.debug(f"SAM v2 using {len(prompt_points_for_model)} interactive points: {prompt_points_for_model}, labels: {prompt_labels_for_model}")
+                else: # Fallback for unknown mode
+                    logger.warning(f"Unknown SAM v2 mode: {self.sam2_segmentation_mode}, defaulting to center_prompt.")
+                    self.sam2_segmentation_mode = "center_prompt" # Correct the mode
+                    prompt_points_for_model = [[small_w // 2, small_h // 2]]
+                    prompt_labels_for_model = [1]
+
+                # Run SAM inference
                 with torch.no_grad():
-                    results = sam_model_to_use(small_rgb, points=[center_point], labels=[
-                                               1], device=self.device, conf=SEGMENTATION_THRESHOLD, verbose=False)
+                    if self.sam2_segmentation_mode == "full_frame":
+                        results = sam_model_to_use(small_rgb, device=self.device, conf=SEGMENTATION_THRESHOLD, verbose=False)
+                    elif prompt_points_for_model and prompt_labels_for_model is not None: # For center_prompt and interactive_prompt with points
+                         results = sam_model_to_use(small_rgb, points=prompt_points_for_model, labels=prompt_labels_for_model,
+                                                   device=self.device, conf=SEGMENTATION_THRESHOLD, verbose=False)
+                    # If interactive mode has no points, results remains None (handled by earlier return)
+                    
                 if results and len(results) > 0 and hasattr(results[0], 'masks') and results[0].masks is not None:
-                    masks_tensor = results[0].masks.data
-                    logger.debug(
-                        f"SAM v2 generated {masks_tensor.shape[0]} masks from center prompt.")
-                    combined_mask_small = np.zeros(
-                        (small_h, small_w), dtype=np.uint8)
-                    for mask in masks_tensor:
-                        combined_mask_small = np.maximum(
-                            combined_mask_small, mask.cpu().numpy().astype(np.uint8) * 255)
-                    combined_mask_resized = cv2.resize(
-                        combined_mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+                    masks_tensor = results[0].masks.data # Typically (N, H, W)
+                    logger.debug(f"SAM v2 ({self.sam2_segmentation_mode}) generated {masks_tensor.shape[0]} masks.")
+                    
+                    if masks_tensor.ndim == 3 and masks_tensor.shape[0] > 0:
+                        # For center_prompt, usually one primary mask.
+                        # For full_frame and interactive_prompt (with potentially multiple points/objects), combine all masks.
+                        if self.sam2_segmentation_mode == "center_prompt":
+                            combined_mask_small = masks_tensor[0].cpu().numpy().astype(np.uint8) * 255
+                        else: # full_frame or interactive_prompt
+                            combined_mask_small = torch.any(masks_tensor, dim=0).cpu().numpy().astype(np.uint8) * 255
+                        
+                        if np.any(combined_mask_small): # Check if mask has content
+                             combined_mask_resized = cv2.resize(combined_mask_small, (w, h), interpolation=cv2.INTER_NEAREST)
+                        else:
+                             combined_mask_resized = None # Ensure it's None if no actual mask content
+                    else: # masks_tensor was empty or not 3D
+                        logger.warning(f"SAM v2 masks_tensor unexpected shape or empty: {masks_tensor.shape if hasattr(masks_tensor, 'shape') else 'N/A'}")
+                        combined_mask_resized = None
                 else:
-                    logger.debug(
-                        "SAM v2 generated no masks from center prompt.")
-            elif use_v1:
+                    logger.debug(f"SAM v2 generated no masks or results structure unexpected ({self.sam2_segmentation_mode} mode).")
+                    combined_mask_resized = None
+
+            elif use_v1: # SAM v1 logic (remains unchanged)
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 logger.debug(f"SAM v1 using full frame: {rgb_frame.shape}")
                 with torch.no_grad():
@@ -1795,25 +1847,34 @@ class PixelSensingEffectRunner:
                     combined_mask_resized = combined_mask_full
                 else:
                     logger.debug("SAM v1 generated no masks.")
+                    combined_mask_resized = None
+
 
             if combined_mask_resized is not None and np.any(combined_mask_resized):
                 combined_mask_blurred = cv2.GaussianBlur(
                     combined_mask_resized, MASK_BLUR_KERNEL, 0)
                 final_mask = (combined_mask_blurred >
-                              127).astype(np.uint8) * 255
-                mask_3d = final_mask[:, :, np.newaxis] / 255.0
-                overlay_color = np.array(SAM_MASK_COLOR, dtype=np.float32)
-                frame_float = frame.astype(np.float32)
-                masked_frame = frame_float * \
-                    (1.0 - mask_3d) + overlay_color * mask_3d * SAM_MASK_ALPHA
-                frame_out = np.clip(masked_frame, 0, 255).astype(np.uint8)
-                self.sam_masks_cache = final_mask
-                # *** OBSOLETE CALL REMOVED HERE ***
-                cv2.putText(frame_out, f"{sam_version_name} Seg.", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, )
-            else:
-                cv2.putText(frame, f"{sam_version_name} No Masks", (10, 50),
+                              127).astype(np.uint8) * 255 # Ensure final_mask is 0 or 255
+                
+                if np.any(final_mask): # Only apply overlay if there's something in the final mask
+                    mask_3d = final_mask[:, :, np.newaxis] / 255.0
+                    overlay_color = np.array(SAM_MASK_COLOR, dtype=np.float32)
+                    frame_float = frame.astype(np.float32)
+                    masked_frame = frame_float * \
+                        (1.0 - mask_3d) + overlay_color * mask_3d * SAM_MASK_ALPHA
+                    frame_out = np.clip(masked_frame, 0, 255).astype(np.uint8)
+                    self.sam_masks_cache = final_mask 
+                    cv2.putText(frame_out, f"{sam_version_name} Seg.", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, )
+                else: # If final_mask is all zeros after processing
+                    cv2.putText(frame, f"{sam_version_name} Empty Mask", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, )
+                    frame_out = original_frame_fallback # Ensure frame_out is original if no valid masks
+            else: # If combined_mask_resized was None or all zeros initially
+                # Message for "No Masks" already handled by SAM v2 interactive mode if no points
+                if not (use_v2 and self.sam2_segmentation_mode == "interactive_prompt" and not self.sam_interactive_points):
+                    cv2.putText(frame, f"{sam_version_name} No Masks", (10, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, )
                 frame_out = original_frame_fallback  # Return original if no masks
 
             elapsed = time.time() - start_time
@@ -2093,7 +2154,8 @@ class PixelSensingEffectRunner:
                     self, "contrast_factor", x / 100.0), )
                 cv2.createTrackbar("LUT Intensity", self.window_name, 100, 100, lambda x: setattr(
                     self, "lut_intensity", x / 100.0), )
-                logger.info("Display window initialized.")
+                cv2.setMouseCallback(self.window_name, self._handle_sam_mouse_click)
+                logger.info("Display window and mouse callback initialized.")
             return True
         except Exception as e:
             logger.error(f"Capture init failed: {e}", exc_info=True)
@@ -2194,12 +2256,46 @@ class PixelSensingEffectRunner:
             elif self.current_effect == "sam_segmentation":
                 sam1_rdy = self.sam_model_v1 is not None
                 sam2_rdy = self.sam_model_v2 is not None
-                if sam1_rdy and sam2_rdy:
-                    self.use_sam2_runtime = not self.use_sam2_runtime
-                    logger.info(
-                        f" -> Toggled SAM pref to {'SAM v2' if self.use_sam2_runtime else 'SAM v1'}")
-                else:
-                    logger.info(" -> Cannot switch SAM (only one loaded).")
+                
+                if sam1_rdy and sam2_rdy: # Both models available
+                    if self.use_sam2_runtime: # Currently SAM v2
+                        if self.sam2_segmentation_mode == "center_prompt":
+                            self.sam2_segmentation_mode = "full_frame"
+                            logger.info(f" -> SAM v2 mode changed to: {self.sam2_segmentation_mode}")
+                        elif self.sam2_segmentation_mode == "full_frame":
+                            self.sam2_segmentation_mode = "interactive_prompt"
+                            self.sam_interactive_points.clear(); self.sam_interactive_labels.clear() # Clear for new mode
+                            self.sam_interactive_points_cleared_once = False
+                            logger.info(f" -> SAM v2 mode changed to: {self.sam2_segmentation_mode}. Points cleared.")
+                        else: # Was interactive_prompt, switch to SAM v1
+                            self.use_sam2_runtime = False
+                            self.sam2_segmentation_mode = "center_prompt" # Reset for next SAMv2 use
+                            self.sam_interactive_points.clear(); self.sam_interactive_labels.clear()
+                            logger.info(" -> Switched to SAM v1 (AutoMask). Interactive points cleared.")
+                    else: # Currently SAM v1, switch to SAM v2 (defaulting to center_prompt)
+                        self.use_sam2_runtime = True
+                        self.sam2_segmentation_mode = "center_prompt"
+                        self.sam_interactive_points.clear(); self.sam_interactive_labels.clear() # Clear points
+                        self.sam_interactive_points_cleared_once = False
+                        logger.info(f" -> Switched to SAM v2 (mode: {self.sam2_segmentation_mode}). Interactive points cleared.")
+                elif sam2_rdy and not sam1_rdy: # Only SAM v2 available
+                     self.use_sam2_runtime = True # Ensure it's true
+                     if self.sam2_segmentation_mode == "center_prompt":
+                         self.sam2_segmentation_mode = "full_frame"
+                     elif self.sam2_segmentation_mode == "full_frame":
+                         self.sam2_segmentation_mode = "interactive_prompt"
+                         self.sam_interactive_points.clear(); self.sam_interactive_labels.clear()
+                         self.sam_interactive_points_cleared_once = False
+                     else: # Was interactive_prompt, cycle back to center_prompt
+                         self.sam2_segmentation_mode = "center_prompt"
+                         self.sam_interactive_points.clear(); self.sam_interactive_labels.clear() 
+                         self.sam_interactive_points_cleared_once = False
+                     logger.info(f" -> SAM v2 (only model) mode changed to: {self.sam2_segmentation_mode}. Points cleared if interactive involved.")
+                elif sam1_rdy and not sam2_rdy: # Only SAM v1 available
+                     self.use_sam2_runtime = False 
+                     logger.info(" -> SAM v1 (only model) active. No mode change.")
+                else: # Neither loaded
+                    logger.info(" -> No SAM models available to switch.")
             else:
                 logger.info(
                     f" -> No variant action for '{self.current_effect}'.")
@@ -2215,6 +2311,13 @@ class PixelSensingEffectRunner:
         self.prev_landmarks_flow = None
         self.prev_face_pts_gold = np.empty((0, 1, 2), dtype=np.float32)
         self.prev_pose_pts_gold = np.empty((0, 1, 2), dtype=np.float32)
+        # Clear SAM interactive points when effects change or are reset
+        if self.sam_interactive_points: # Check if list is not empty
+            self.sam_interactive_points.clear()
+            self.sam_interactive_labels.clear()
+            logger.info("Cleared SAM interactive prompt points due to effect reset/change.")
+        self.sam_interactive_points_cleared_once = False # Reset this flag too
+
 
     def run(self) -> None:
         """Main video processing loop."""
@@ -2269,6 +2372,22 @@ class PixelSensingEffectRunner:
                 fps_text = f"FPS: {avg_fps:.1f}"
                 cv2.putText(processed_frame, fps_text, (10, target_h - 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Visual feedback for SAM interactive points on the processed_frame
+                if (self.current_effect == "sam_segmentation" and 
+                    self.use_sam2_runtime and 
+                    self.sam2_segmentation_mode == "interactive_prompt" and 
+                    self.sam_interactive_points):
+                    # Ensure processed_frame is writable for drawing
+                    if not processed_frame.flags.writeable:
+                        processed_frame = processed_frame.copy()
+
+                    for i, point_coords in enumerate(self.sam_interactive_points):
+                        color = (0, 255, 0) if self.sam_interactive_labels[i] == 1 else (0, 0, 255) # Green for positive, Red for negative
+                        cv2.circle(processed_frame, point_coords, 5, color, -1) # Draw filled circle
+                        cv2.putText(processed_frame, str(i+1), (point_coords[0] + 7, point_coords[1] - 7), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
 
                 if self.out:
                     self.out.write(processed_frame)
@@ -2278,7 +2397,7 @@ class PixelSensingEffectRunner:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                elif key in [ord("e"), ord("w")]:
+                elif key in [ord("e"), ord("w")]: # Cycle effects
                     direction = 1 if key == ord("e") else -1
                     effect_keys = list(self.effects.keys())
                     if effect_keys:
@@ -2287,10 +2406,81 @@ class PixelSensingEffectRunner:
                             next_idx = (current_idx + direction + len(effect_keys)) % len(effect_keys)
                             self.current_effect = effect_keys[next_idx]
                             logger.info(f"Key '{chr(key)}': Switched effect -> {self.current_effect}")
-                            self._reset_effect_states()
-                        except ValueError:
-                            self.current_effect = effect_keys[0]
-                            logger.warning("Effect error, reset.")
+                            self._reset_effect_states() # This will also clear SAM points if effect changes
+                        except ValueError: # Should not happen if self.current_effect is always valid
+                            self.current_effect = effect_keys[0] if effect_keys else "none"
+                            logger.warning(f"Current effect '{self.current_effect}' not in keys, reset to first.")
+                elif key == ord("v"): # Toggle variants / SAM modes
+                    logger.info(f"Key 'v': Cycling variant for '{self.current_effect}'...")
+                    if self.current_effect == "goldenaura":
+                        self.goldenaura_variant = (self.goldenaura_variant + 1) % len(self.goldenaura_variant_names)
+                        logger.info(f" -> Switched Aura to {self.goldenaura_variant_names[self.goldenaura_variant]}")
+                    elif self.current_effect == "lightning":
+                        self.lightning_style_index = (self.lightning_style_index + 1) % len(self.lightning_styles)
+                        logger.info(f" -> Switched Lightning to {self.lightning_style_names[self.lightning_style_index]}")
+                    elif (self.current_effect == "lut_color_grade" and self.lut_color_grade_effect):
+                        self.lut_color_grade_effect.cycle_lut()
+                    elif self.current_effect == "rvm_composite":
+                        self.rvm_display_mode = (self.rvm_display_mode + 1) % len(self.RVM_DISPLAY_MODES)
+                        logger.info(f" -> Switched RVM mode to {self.RVM_DISPLAY_MODES[self.rvm_display_mode]}")
+                        self.rvm_rec = [None] * 4 # Reset RVM state
+                    elif self.current_effect == "sam_segmentation":
+                        sam1_rdy = self.sam_model_v1 is not None
+                        sam2_rdy = self.sam_model_v2 is not None
+                        
+                        if sam1_rdy and sam2_rdy: # Both models available
+                            if self.use_sam2_runtime: # Currently SAM v2
+                                if self.sam2_segmentation_mode == "center_prompt":
+                                    self.sam2_segmentation_mode = "full_frame"
+                                    logger.info(f" -> SAM v2 mode changed to: {self.sam2_segmentation_mode}")
+                                elif self.sam2_segmentation_mode == "full_frame":
+                                    self.sam2_segmentation_mode = "interactive_prompt"
+                                    self.sam_interactive_points.clear(); self.sam_interactive_labels.clear() # Clear for new mode
+                                    self.sam_interactive_points_cleared_once = False
+                                    logger.info(f" -> SAM v2 mode changed to: {self.sam2_segmentation_mode}. Points cleared.")
+                                else: # Was interactive_prompt, switch to SAM v1
+                                    self.use_sam2_runtime = False
+                                    self.sam2_segmentation_mode = "center_prompt" # Reset for next SAMv2 use
+                                    self.sam_interactive_points.clear(); self.sam_interactive_labels.clear()
+                                    logger.info(" -> Switched to SAM v1 (AutoMask). Interactive points cleared.")
+                            else: # Currently SAM v1, switch to SAM v2 (defaulting to center_prompt)
+                                self.use_sam2_runtime = True
+                                self.sam2_segmentation_mode = "center_prompt"
+                                self.sam_interactive_points.clear(); self.sam_interactive_labels.clear() # Clear points
+                                self.sam_interactive_points_cleared_once = False
+                                logger.info(f" -> Switched to SAM v2 (mode: {self.sam2_segmentation_mode}). Interactive points cleared.")
+                        elif sam2_rdy and not sam1_rdy: # Only SAM v2 available
+                            self.use_sam2_runtime = True # Ensure it's true
+                            if self.sam2_segmentation_mode == "center_prompt":
+                                self.sam2_segmentation_mode = "full_frame"
+                            elif self.sam2_segmentation_mode == "full_frame":
+                                self.sam2_segmentation_mode = "interactive_prompt"
+                                self.sam_interactive_points.clear(); self.sam_interactive_labels.clear()
+                                self.sam_interactive_points_cleared_once = False
+                            else: # Was interactive_prompt, cycle back to center_prompt
+                                self.sam2_segmentation_mode = "center_prompt"
+                                self.sam_interactive_points.clear(); self.sam_interactive_labels.clear() 
+                                self.sam_interactive_points_cleared_once = False
+                            logger.info(f" -> SAM v2 (only model) mode changed to: {self.sam2_segmentation_mode}. Points cleared if interactive involved.")
+                        elif sam1_rdy and not sam2_rdy: # Only SAM v1 available
+                            self.use_sam2_runtime = False 
+                            logger.info(" -> SAM v1 (only model) active. No mode change.")
+                        else:
+                            logger.info(" -> No SAM models available for mode switching.")
+                    else:
+                        logger.info(f" -> No variant action for '{self.current_effect}'.")
+                elif key == ord('c'): # Clear points for SAM interactive
+                    if (self.current_effect == "sam_segmentation" and 
+                        self.use_sam2_runtime and 
+                        self.sam2_segmentation_mode == "interactive_prompt"):
+                        if self.sam_interactive_points: # Only log if there were points to clear
+                            self.sam_interactive_points.clear()
+                            self.sam_interactive_labels.clear()
+                            logger.info("Cleared SAM interactive prompt points by key 'c'.")
+                        else: # Log even if already empty, for feedback
+                            logger.info("SAM interactive points already empty (cleared by 'c').")
+                        self.sam_interactive_points_cleared_once = False # Allow "No points" message to show again
+
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt detected. Exiting loop.")
@@ -2311,6 +2501,8 @@ if __name__ == "__main__":
 ============================== PixelSensingFX Controls Manual ==============================
 General: Q(Quit), E(Next Effect), W(Prev Effect), R(Reset All)
 Variants (V): Cycles modes (Aura, Lightning, LUT, RVM Mode, SAM Pref).
+              For SAM Segmentation: V cycles SAMv1 -> SAMv2(Center) -> SAMv2(Full) -> SAMv2(Interactive)
+Clear Points (C): Clears points in SAM Interactive mode.
 Models (M): Cycles RVM model.
 Trackbars: Brightness, Contrast, LUT Intensity (0-100%).
 See config.json or --help for config options. Check logs/ for details.
